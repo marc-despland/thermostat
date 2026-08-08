@@ -1,0 +1,13 @@
+menu "Thermostat Simulator Configuration"
+
+    config THERMOSTAT_SIM_REPORT_INTERVAL_SEC
+        int "Simulated DP report interval (seconds)"
+        default 30
+        range 5 3600
+        help
+            How often the simulated KETOTEK sends an unprompted Tuya DP
+            report (local temperature, setpoint, state) after joining the
+            gateway's network, mimicking the real device's autonomous
+            periodic reporting behavior.
+
+endmenu

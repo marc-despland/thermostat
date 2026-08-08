@@ -1,0 +1,27 @@
+menu "Gateway Configuration"
+
+    config THERMOSTAT_ENABLE_CLI
+        bool "Enable Console CLI Commands"
+        default y
+        help
+            Reserved for future console CLI commands for device pairing and
+            management (permit_join <duration>, list_devices, remove_device
+            <index>). Not implemented yet - guard any future CLI code behind
+            this option.
+
+    config THERMOSTAT_DEFAULT_CHANNEL
+        int "Zigbee Channel (15-25)"
+        default 25
+        range 15 25
+        help
+            Primary Zigbee channel (15, 20, 25 recommended).
+            KETOTEK typically uses 15, 20, or 25.
+
+    config THERMOSTAT_MAX_CHILDREN
+        int "Maximum Child Devices"
+        default 10
+        range 1 32
+        help
+            Maximum number of child devices that can be connected.
+
+endmenu
