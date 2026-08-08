@@ -26,6 +26,11 @@
 
 static const char *TAG = "ESP_ZB_GATEWAY";
 
+/* Clearly-tagged markers for the "Cas simple" scenario steps (SPECIFICATIONS.md),
+ * logged at WARN level so they stand out from the regular INFO noise when
+ * watching two idf.py monitor windows side by side (gateway + thermostat). */
+#define SCENARIO_LOG(fmt, ...) ESP_LOGW(TAG, "########## CAS SIMPLE [GATEWAY] - " fmt " ##########", ##__VA_ARGS__)
+
 /* Global variables for thermostat state, mirrored from ZCL Thermostat cluster
  * attribute reports (standard cluster 0x0201 path). */
 static int16_t g_local_temperature = DEFAULT_LOCAL_TEMPERATURE;
@@ -57,12 +62,17 @@ static bool g_send_in_progress = false;
 static uint64_t g_last_report_time = 0;
 
 /* "Cas simple" test scenario (SPECIFICATIONS.md): send a demo setpoint once,
- * right after the newly paired device's first Tuya status report - not
- * immediately on device-announce (the device may not be ready to receive
- * commands yet), and not on a free-running timer (see the removed old/
- * hack). 0 = no device currently awaiting its first setpoint. */
-static uint16_t g_awaiting_setpoint_addr = 0;
-static uint8_t g_awaiting_setpoint_endpoint = 0;
+ * right after the FIRST Tuya status report received since THIS gateway boot -
+ * not on a free-running timer (see the removed old/ hack). Deliberately NOT
+ * gated on ESP_ZB_ZDO_SIGNAL_DEVICE_ANNCE: that signal only fires on a true
+ * (re)association, but a device that's already joined and just reboots
+ * (esp_zb_bdb_is_factory_new() == false, e.g. the real KETOTEK, or our own
+ * thermostat sim across repeated test reflashes) resumes silently without
+ * re-announcing - relying on DEVICE_ANNCE left g_awaiting_setpoint_addr at 0
+ * forever after the gateway's own reboot, in which case a report could
+ * arrive and be logged but the demo setpoint would never fire. Use the
+ * report's own source address instead. */
+static bool g_demo_setpoint_sent = false;
 #define DEMO_HEATING_SETPOINT_DEG 21
 
 static void tuya_send_set_temperature(uint16_t dst_addr, uint8_t dst_endpoint, int16_t temperature_deg);
@@ -175,8 +185,13 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
     case ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID:
         ret = zb_attribute_handler((esp_zb_zcl_set_attr_value_message_t *)message);
         break;
-    case ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_REQ_CB_ID: {
-        /* Handle TUYA custom cluster 0xef00 commands from KETOTEK */
+    case ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_REQ_CB_ID:
+    case ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_RESP_CB_ID: {
+        /* Handle TUYA custom cluster 0xef00 commands from KETOTEK. Both
+         * REQ and RESP fire here: the SDK dispatches direction=TO_SRV
+         * frames to _REQ_CB_ID and direction=TO_CLI frames to
+         * _RESP_CB_ID - Tuya's report/command flow doesn't map cleanly to
+         * that req/resp split, so handle both identically. */
         esp_zb_zcl_custom_cluster_command_message_t *custom_cmd = (esp_zb_zcl_custom_cluster_command_message_t *)message;
         ESP_LOGI(TAG, "TUYA custom command - Cluster:0x%04x, Cmd:0x%02x, Addr:0x%04x, Endpoint:%d, DataLen:%d",
                  custom_cmd->info.cluster, custom_cmd->info.command.id,
@@ -216,13 +231,17 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
                 }
 
                 /* "Cas simple" scenario, step "La gateway envoi la temperature
-                 * de consigne au thermostat": react to the newly paired
-                 * device's first status report by sending it the demo
-                 * setpoint (one-shot, see g_awaiting_setpoint_addr above). */
-                if (g_awaiting_setpoint_addr != 0 && custom_cmd->info.src_address.u.short_addr == g_awaiting_setpoint_addr) {
-                    ESP_LOGI(TAG, "Status received from newly paired device 0x%04x - sending setpoint now", g_awaiting_setpoint_addr);
-                    tuya_send_set_temperature(g_awaiting_setpoint_addr, g_awaiting_setpoint_endpoint, DEMO_HEATING_SETPOINT_DEG);
-                    g_awaiting_setpoint_addr = 0;
+                 * de consigne au thermostat": react to the first status
+                 * report seen since boot by sending the demo setpoint back
+                 * to whoever sent it (one-shot per gateway boot, see
+                 * g_demo_setpoint_sent above - not gated on DEVICE_ANNCE). */
+                if (!g_demo_setpoint_sent) {
+                    uint16_t src_addr = custom_cmd->info.src_address.u.short_addr;
+                    uint8_t src_ep = custom_cmd->info.src_endpoint;
+                    SCENARIO_LOG("Etape 4/5: STATUT RECU du thermostat (device=0x%04x)", src_addr);
+                    SCENARIO_LOG("Etape 5/5: ENVOI DE LA CONSIGNE au thermostat (%d C) - voir 'TUYA command sent' ci-dessous pour le resultat", DEMO_HEATING_SETPOINT_DEG);
+                    tuya_send_set_temperature(src_addr, src_ep, DEMO_HEATING_SETPOINT_DEG);
+                    g_demo_setpoint_sent = true;
                 }
             } else if (cmd_id == TUYA_CMD_TIME_SYNC) {
                 ESP_LOGI(TAG, "  -> TUYA Time Sync Request (TODO: unhandled, no response sent)");
@@ -269,11 +288,20 @@ static void tuya_send_data_query(uint16_t dst_addr, uint8_t dst_endpoint)
             .src_endpoint = ESP_ZB_GATEWAY_ENDPOINT,
         },
         .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .profile_id = ESP_ZB_AF_HA_PROFILE_ID,
         .cluster_id = TUYA_CLUSTER_ID,
         .custom_cmd_id = TUYA_CMD_QUERY,
         .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
         .data = {
-            .type = ESP_ZB_ZCL_ATTR_TYPE_ARRAY,
+            /* NOT ARRAY: per the SDK doc, ARRAY/16BIT_ARRAY/32BIT_ARRAY expect
+             * the first 2 bytes of the buffer to BE a count prefix that the
+             * stack re-parses (size = 2 + sum of content len) - our raw Tuya
+             * bytes (seq number first) got misread as a huge count, inflating
+             * the computed frame size until NWK silently dropped it as
+             * "too big" (confirmed via a low-level APS trace capture on
+             * real hardware: buf_len 261/517/773 for 7-10 byte payloads).
+             * SET has no such prefix - size is just the raw byte count. */
+            .type = ESP_ZB_ZCL_ATTR_TYPE_SET,
             .value = tuya_query,
             .size = sizeof(tuya_query),
         },
@@ -337,11 +365,20 @@ static void tuya_send_set_temperature(uint16_t dst_addr, uint8_t dst_endpoint, i
             .src_endpoint = ESP_ZB_GATEWAY_ENDPOINT,
         },
         .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .profile_id = ESP_ZB_AF_HA_PROFILE_ID,
         .cluster_id = TUYA_CLUSTER_ID,
         .custom_cmd_id = TUYA_CMD_SET_DATA,
         .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
         .data = {
-            .type = ESP_ZB_ZCL_ATTR_TYPE_ARRAY,
+            /* NOT ARRAY: per the SDK doc, ARRAY/16BIT_ARRAY/32BIT_ARRAY expect
+             * the first 2 bytes of the buffer to BE a count prefix that the
+             * stack re-parses (size = 2 + sum of content len) - our raw Tuya
+             * bytes (seq number first) got misread as a huge count, inflating
+             * the computed frame size until NWK silently dropped it as
+             * "too big" (confirmed via a low-level APS trace capture on
+             * real hardware: buf_len 261/517/773 for 7-10 byte payloads).
+             * SET has no such prefix - size is just the raw byte count. */
+            .type = ESP_ZB_ZCL_ATTR_TYPE_SET,
             .value = g_tuya_cmd_buffer,
             .size = 10,
         },
@@ -399,6 +436,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                      ieee_address[3], ieee_address[2], ieee_address[1], ieee_address[0],
                      esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address());
 
+            SCENARIO_LOG("Gateway PRETE - reseau ouvert 180s, en attente du thermostat");
             ESP_LOGI(TAG, "Opening network for 180 seconds - start KETOTEK pairing now");
             esp_zb_bdb_open_network(180);
 
@@ -422,6 +460,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             g_paired_devices[g_paired_devices_count].endpoint = 1;
             snprintf(g_paired_devices[g_paired_devices_count].model, sizeof(g_paired_devices[g_paired_devices_count].model), "Device_%d", g_paired_devices_count + 1);
             g_paired_devices_count++;
+            SCENARIO_LOG("Etape 3/5: THERMOSTAT APPAIRE (short=0x%04hx)", dev_annce_params->device_short_addr);
             ESP_LOGI(TAG, "Device REGISTERED! Total paired devices: %d", g_paired_devices_count);
 
             ESP_LOGI(TAG, "=== PAIRED DEVICES ===");
@@ -431,14 +470,15 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             ESP_LOGI(TAG, "======================");
 
             /* "Cas simple" scenario: don't send the setpoint yet - wait for
-             * this device's first status report (see the TUYA_CMD_REPORT
-             * handling above) so it's confirmed awake and ready to receive
-             * commands. TODO(THERMOSTAT_ENABLE_CLI): replace this demo
-             * one-shot with a real "set setpoint" console command. */
-            g_awaiting_setpoint_addr = dev_annce_params->device_short_addr;
-            g_awaiting_setpoint_endpoint = 1;
-            ESP_LOGI(TAG, "Will send demo setpoint (%d C) once device 0x%04hx reports its status",
-                     DEMO_HEATING_SETPOINT_DEG, dev_annce_params->device_short_addr);
+             * the first status report seen since boot (see the
+             * TUYA_CMD_REPORT handling above, g_demo_setpoint_sent) so
+             * whoever sent it is confirmed awake and ready to receive
+             * commands. This fires on true (re)association; a device that's
+             * already joined and merely reboots won't hit this case at all,
+             * but will still trigger the demo setpoint via its first report.
+             * TODO(THERMOSTAT_ENABLE_CLI): replace this demo one-shot with a
+             * real "set setpoint" console command. */
+            ESP_LOGI(TAG, "Will send demo setpoint (%d C) once any device reports its status", DEMO_HEATING_SETPOINT_DEG);
         } else {
             ESP_LOGW(TAG, "Max devices reached (%d). Cannot register more.", MAX_PAIRED_DEVICES);
         }
@@ -522,6 +562,7 @@ static void esp_zb_task(void *pvParameters)
 
 void app_main(void)
 {
+    SCENARIO_LOG("Etape 1/5: GATEWAY DEMARRE");
     esp_zb_platform_config_t config = {
         .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
         .host_config = ESP_ZB_DEFAULT_HOST_CONFIG(),

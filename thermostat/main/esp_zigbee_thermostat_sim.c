@@ -30,6 +30,11 @@
 
 static const char *TAG = "ESP_ZB_THERMOSTAT_SIM";
 
+/* Clearly-tagged markers for the "Cas simple" scenario steps (SPECIFICATIONS.md),
+ * logged at WARN level so they stand out from the regular INFO noise when
+ * watching two idf.py monitor windows side by side (gateway + thermostat). */
+#define SCENARIO_LOG(fmt, ...) ESP_LOGW(TAG, "########## CAS SIMPLE [THERMOSTAT] - " fmt " ##########", ##__VA_ARGS__)
+
 /* Simulated local thermostat state. ZCL Thermostat cluster attributes are in
  * 0.01C units (x100); Tuya DP values for KETOTEK are in 0.1C units (x10) -
  * see tuya_dp_from_zcl_temp()/tuya_dp_to_zcl_temp() below for the conversion. */
@@ -50,6 +55,17 @@ static uint8_t g_system_mode = DEFAULT_SYSTEM_MODE;
 static uint16_t g_tuya_seq = 0;
 static esp_timer_handle_t g_report_timer = NULL;
 
+/* Static buffer for outgoing TUYA DP reports - mirrors /gateway's
+ * g_tuya_cmd_buffer: the Zigbee API needs the buffer to stay valid for the
+ * duration of the async send, so it can't be a stack local. Sends happen
+ * back-to-back from a single context (tuya_send_dp_report), never concurrently. */
+static uint8_t g_tuya_report_buf[10];
+
+/* "Cas simple" scenario: only bannerize the very first status report after
+ * pairing (Etape 4/5) - subsequent periodic reports log normally, without
+ * repeating the scenario banner every CONFIG_THERMOSTAT_SIM_REPORT_INTERVAL_SEC. */
+static bool g_scenario_first_report_done = false;
+
 /* x100 (ZCL) <-> x10 (Tuya DP) temperature unit conversion. */
 static inline int32_t tuya_dp_from_zcl_temp(int16_t zcl_x100)
 {
@@ -62,18 +78,17 @@ static inline int16_t tuya_dp_to_zcl_temp(int32_t tuya_x10)
 
 static void tuya_send_dp_value(uint16_t dst_addr, uint8_t dst_endpoint, uint8_t dp_id, int32_t value)
 {
-    uint8_t buf[10];
     g_tuya_seq++;
     if (g_tuya_seq >= 0xFFFF) {
         g_tuya_seq = 0;
     }
-    buf[0] = (g_tuya_seq >> 8) & 0xFF;
-    buf[1] = g_tuya_seq & 0xFF;
-    buf[2] = dp_id;
-    buf[3] = TUYA_DP_TYPE_VALUE;
-    buf[4] = 0x00;
-    buf[5] = 0x04;
-    tuya_dp_encode_value(&buf[6], value);
+    g_tuya_report_buf[0] = (g_tuya_seq >> 8) & 0xFF;
+    g_tuya_report_buf[1] = g_tuya_seq & 0xFF;
+    g_tuya_report_buf[2] = dp_id;
+    g_tuya_report_buf[3] = TUYA_DP_TYPE_VALUE;
+    g_tuya_report_buf[4] = 0x00;
+    g_tuya_report_buf[5] = 0x04;
+    tuya_dp_encode_value(&g_tuya_report_buf[6], value);
 
     esp_zb_zcl_custom_cluster_cmd_req_t cmd_req = {
         .zcl_basic_cmd = {
@@ -82,20 +97,33 @@ static void tuya_send_dp_value(uint16_t dst_addr, uint8_t dst_endpoint, uint8_t 
             .src_endpoint = THERMOSTAT_SIM_ENDPOINT,
         },
         .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .profile_id = ESP_ZB_AF_HA_PROFILE_ID,
         .cluster_id = TUYA_CLUSTER_ID,
         .custom_cmd_id = TUYA_CMD_REPORT_1,
-        /* Mirror of /gateway's tuya_send_set_temperature(), reversed: gateway
-         * receives DP reports on its Tuya CLIENT-role cluster instance, so
-         * this end device's SERVER-role instance sends with direction
-         * TO_CLI. TODO: verify against a real two-board join (see plan's
-         * verification step 4) - not yet exercised on real hardware. */
-        .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI,
+        /* Two real-hardware tests: first with direction TO_CLI + missing
+         * .profile_id -> nothing received by gateway, no error either side.
+         * Second, after fixing .profile_id, still nothing. The SDK
+         * dispatches incoming custom-cluster frames to one of two distinct
+         * callbacks depending on this direction bit - TO_SRV goes to
+         * ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_REQ_CB_ID, TO_CLI goes to
+         * ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_RESP_CB_ID (gateway now handles
+         * both, but switching to TO_SRV here too so this matches
+         * /gateway's own outgoing direction and the callback it originally
+         * decoded for). */
+        .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
         .data = {
-            .type = ESP_ZB_ZCL_ATTR_TYPE_ARRAY,
-            .value = buf,
-            .size = sizeof(buf),
+            /* NOT ARRAY - see the matching comment in /gateway's
+             * tuya_send_set_temperature(): ARRAY expects a 2-byte count
+             * prefix that the stack re-parses, which corrupted our raw Tuya
+             * payload's leading seq-number bytes into a bogus huge size,
+             * silently dropped by NWK as "too big" (confirmed via hardware
+             * trace). SET has no such prefix. */
+            .type = ESP_ZB_ZCL_ATTR_TYPE_SET,
+            .value = g_tuya_report_buf,
+            .size = 10,
         },
     };
+    ESP_LOG_BUFFER_HEX_LEVEL(TAG, g_tuya_report_buf, 10, ESP_LOG_INFO);
     uint8_t tx_seq = esp_zb_zcl_custom_cluster_cmd_req(&cmd_req);
     if (tx_seq == 0xFF) {
         ESP_LOGE(TAG, "Failed to send DP%u report: stack rejected command", dp_id);
@@ -106,18 +134,17 @@ static void tuya_send_dp_value(uint16_t dst_addr, uint8_t dst_endpoint, uint8_t 
 
 static void tuya_send_dp_bool(uint16_t dst_addr, uint8_t dst_endpoint, uint8_t dp_id, bool value)
 {
-    uint8_t buf[7];
     g_tuya_seq++;
     if (g_tuya_seq >= 0xFFFF) {
         g_tuya_seq = 0;
     }
-    buf[0] = (g_tuya_seq >> 8) & 0xFF;
-    buf[1] = g_tuya_seq & 0xFF;
-    buf[2] = dp_id;
-    buf[3] = TUYA_DP_TYPE_BOOL;
-    buf[4] = 0x00;
-    buf[5] = 0x01;
-    buf[6] = value ? 1 : 0;
+    g_tuya_report_buf[0] = (g_tuya_seq >> 8) & 0xFF;
+    g_tuya_report_buf[1] = g_tuya_seq & 0xFF;
+    g_tuya_report_buf[2] = dp_id;
+    g_tuya_report_buf[3] = TUYA_DP_TYPE_BOOL;
+    g_tuya_report_buf[4] = 0x00;
+    g_tuya_report_buf[5] = 0x01;
+    g_tuya_report_buf[6] = value ? 1 : 0;
 
     esp_zb_zcl_custom_cluster_cmd_req_t cmd_req = {
         .zcl_basic_cmd = {
@@ -126,15 +153,23 @@ static void tuya_send_dp_bool(uint16_t dst_addr, uint8_t dst_endpoint, uint8_t d
             .src_endpoint = THERMOSTAT_SIM_ENDPOINT,
         },
         .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .profile_id = ESP_ZB_AF_HA_PROFILE_ID,
         .cluster_id = TUYA_CLUSTER_ID,
         .custom_cmd_id = TUYA_CMD_REPORT_1,
-        .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI,
+        .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
         .data = {
-            .type = ESP_ZB_ZCL_ATTR_TYPE_ARRAY,
-            .value = buf,
-            .size = sizeof(buf),
+            /* NOT ARRAY - see the matching comment in /gateway's
+             * tuya_send_set_temperature(): ARRAY expects a 2-byte count
+             * prefix that the stack re-parses, which corrupted our raw Tuya
+             * payload's leading seq-number bytes into a bogus huge size,
+             * silently dropped by NWK as "too big" (confirmed via hardware
+             * trace). SET has no such prefix. */
+            .type = ESP_ZB_ZCL_ATTR_TYPE_SET,
+            .value = g_tuya_report_buf,
+            .size = 7,
         },
     };
+    ESP_LOG_BUFFER_HEX_LEVEL(TAG, g_tuya_report_buf, 7, ESP_LOG_INFO);
     uint8_t tx_seq = esp_zb_zcl_custom_cluster_cmd_req(&cmd_req);
     if (tx_seq == 0xFF) {
         ESP_LOGE(TAG, "Failed to send DP%u report: stack rejected command", dp_id);
@@ -148,6 +183,11 @@ static void tuya_send_dp_bool(uint16_t dst_addr, uint8_t dst_endpoint, uint8_t d
  * Real Tuya devices send one DP per message, so this issues several sends. */
 static void tuya_send_dp_report(uint16_t dst_addr, uint8_t dst_endpoint)
 {
+    if (!g_scenario_first_report_done) {
+        SCENARIO_LOG("Etape 4/5: ENVOI DU STATUT a la gateway (temp=%.1fC, setpoint=%.1fC)",
+                     g_local_temperature / 100.0, g_occupied_heating_setpoint / 100.0);
+        g_scenario_first_report_done = true;
+    }
     tuya_send_dp_bool(dst_addr, dst_endpoint, KETOTEK_DP_SYSTEM_STATE, g_system_mode != 0);
     tuya_send_dp_value(dst_addr, dst_endpoint, KETOTEK_DP_LOCAL_TEMP, tuya_dp_from_zcl_temp(g_local_temperature));
     tuya_send_dp_value(dst_addr, dst_endpoint, KETOTEK_DP_HEATING_SETPOINT, tuya_dp_from_zcl_temp(g_occupied_heating_setpoint));
@@ -206,6 +246,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                 /* End device: search for an open network to join - NOT
                  * MODE_NETWORK_FORMATION, that's the coordinator-only path
                  * used by /gateway. */
+                SCENARIO_LOG("Recherche d'un reseau a rejoindre...");
                 ESP_LOGI(TAG, "Start network steering");
                 esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
             } else {
@@ -224,6 +265,8 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                      extended_pan_id[7], extended_pan_id[6], extended_pan_id[5], extended_pan_id[4],
                      extended_pan_id[3], extended_pan_id[2], extended_pan_id[1], extended_pan_id[0],
                      esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address());
+            SCENARIO_LOG("Etape 3/5: THERMOSTAT APPAIRE a la gateway (PAN 0x%04hx, canal %d)",
+                         esp_zb_get_pan_id(), esp_zb_get_current_channel());
             start_report_timer();
         } else {
             ESP_LOGI(TAG, "Network steering was not successful (status: %s)", esp_err_to_name(err_status));
@@ -281,6 +324,7 @@ static void handle_tuya_set_data(const uint8_t *data, uint16_t len)
         if (dp_len == 4) {
             int32_t tuya_setpoint = tuya_dp_decode_value(dp_data);
             g_occupied_heating_setpoint = tuya_dp_to_zcl_temp(tuya_setpoint);
+            SCENARIO_LOG("Etape 5/5: CONSIGNE RECUE ET APPLIQUEE (%.1f C)", tuya_setpoint / 10.0);
             ESP_LOGI(TAG, "DP%u: heating setpoint updated to %.1f C", dp_id, tuya_setpoint / 10.0);
         }
         break;
@@ -303,7 +347,9 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
     case ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID:
         ret = zb_attribute_handler((esp_zb_zcl_set_attr_value_message_t *)message);
         break;
-    case ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_REQ_CB_ID: {
+    case ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_REQ_CB_ID:
+    case ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_RESP_CB_ID: {
+        /* Handle both - see the matching comment in /gateway's zb_action_handler. */
         esp_zb_zcl_custom_cluster_command_message_t *custom_cmd = (esp_zb_zcl_custom_cluster_command_message_t *)message;
         uint8_t cmd_id = custom_cmd->info.command.id;
         uint8_t *data = custom_cmd->data.value;
@@ -378,6 +424,7 @@ static void esp_zb_task(void *pvParameters)
 
 void app_main(void)
 {
+    SCENARIO_LOG("Etape 2/5: THERMOSTAT DEMARRE");
     esp_zb_platform_config_t config = {
         .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
         .host_config = ESP_ZB_DEFAULT_HOST_CONFIG(),
