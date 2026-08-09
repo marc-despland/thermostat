@@ -17,12 +17,18 @@
 
 #define TUYA_CLUSTER_ID          0xEF00
 
-/* Tuya cluster 0xEF00 command IDs */
-#define TUYA_CMD_SET_DATA        0x00 /* Set DataPoint (gateway -> device) */
-#define TUYA_CMD_REPORT_1        0x01 /* Device -> gateway report */
-#define TUYA_CMD_REPORT_2        0x02 /* Device -> gateway report */
-#define TUYA_CMD_QUERY           0x11 /* Data Query request (query all DPs) */
-#define TUYA_CMD_TIME_SYNC       0x24 /* Time sync request - TODO: unhandled */
+/* Tuya cluster 0xEF00 command IDs. Per the official Tuya Zigbee Universal
+ * Docking Access Standard (developer.tuya.com/en/docs/iot/
+ * tuya-zigbee-universal-docking-access-standard?id=K9ik6zvofpzql), NOT the
+ * old TUYA_CMD_QUERY=0x11 guess (see below) - see SPECIFICATIONS.md
+ * "Protocole" for how that mistake was found. */
+#define TUYA_CMD_SET_DATA        0x00 /* TY_DATA_REQUEST: gateway -> device data request */
+#define TUYA_CMD_REPORT_1        0x01 /* TY_DATA_RESPONE: device -> gateway, response to a data request */
+#define TUYA_CMD_REPORT_2        0x02 /* TY_DATA_REPORT: device -> gateway, spontaneous report (two-way) */
+#define TUYA_CMD_QUERY           0x03 /* TY_DATA_QUERY: gateway -> device, query all current DPs - zero-length payload, no seq bytes even */
+#define TUYA_CMD_MCU_VERSION_REQ 0x10 /* TUYA_MCU_VERSION_REQ: gateway -> device, query MCU firmware version */
+#define TUYA_CMD_MCU_VERSION_RSP 0x11 /* TUYA_MCU_VERSION_RSP: device -> gateway, MCU firmware version (NOT a data query - this is what we mistakenly sent as "0x11 query" before) */
+#define TUYA_CMD_TIME_SYNC       0x24 /* TUYA_MCU_SYNC_TIME: time sync request - TODO: unhandled */
 
 typedef enum {
     TUYA_DP_TYPE_BOOL   = 0x01,

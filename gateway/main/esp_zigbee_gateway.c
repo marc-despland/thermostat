@@ -15,6 +15,7 @@
  * CONDITIONS OF ANY KIND, either express or implied.
  */
 #include <stdio.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_check.h"
@@ -40,6 +41,8 @@ static uint8_t g_system_mode = DEFAULT_SYSTEM_MODE;
 /* Device list for tracking paired devices */
 typedef struct {
     uint16_t short_addr;
+    esp_zb_ieee_addr_t ieee_addr; /* only valid if ieee_addr_known */
+    bool ieee_addr_known;
     uint8_t endpoint;
     char model[64];
 } zb_device_t;
@@ -47,6 +50,22 @@ typedef struct {
 #define MAX_PAIRED_DEVICES 10
 static zb_device_t g_paired_devices[MAX_PAIRED_DEVICES];
 static uint8_t g_paired_devices_count = 0;
+
+/* Look up a known device's IEEE address by short address - needed for ZDO
+ * bind requests (esp_zb_zdo_device_bind_req() only takes 64-bit addresses).
+ * Returns NULL if the device isn't in g_paired_devices[] or its IEEE
+ * address was never captured (e.g. gateway rebooted and the device resumed
+ * without re-announcing - see the DEVICE_ANNCE caveat elsewhere in this
+ * file). */
+static const esp_zb_ieee_addr_t *find_paired_device_ieee(uint16_t short_addr)
+{
+    for (int i = 0; i < g_paired_devices_count; i++) {
+        if (g_paired_devices[i].short_addr == short_addr && g_paired_devices[i].ieee_addr_known) {
+            return &g_paired_devices[i].ieee_addr;
+        }
+    }
+    return NULL;
+}
 
 /* Sequence number management - synchronized with device */
 static uint16_t g_tuya_seq = 0;        /* Our sequence counter for commands */
@@ -111,6 +130,8 @@ static void demo_setpoint_mark_sent(uint16_t short_addr)
 static void tuya_send_set_temperature(uint16_t dst_addr, uint8_t dst_endpoint, int16_t temperature_deg);
 static void tuya_send_data_query(uint16_t dst_addr, uint8_t dst_endpoint);
 static void zcl_send_read_thermostat_attrs(uint16_t dst_addr, uint8_t dst_endpoint);
+static void zcl_send_read_basic_attrs(uint16_t dst_addr, uint8_t dst_endpoint);
+static void zdo_bind_basic_cluster(uint16_t dst_short_addr, const esp_zb_ieee_addr_t dst_ieee_addr, uint8_t dst_endpoint);
 
 /* Standard ZCL Thermostat cluster (0x0201) attribute update callback. */
 static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t *message)
@@ -288,6 +309,18 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
                          resp->info.src_address.u.short_addr, var->attribute.id, var->status);
                 continue;
             }
+            if (var->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING) {
+                /* ZCL character strings are length-prefixed, not
+                 * null-terminated: value[0] = length, value[1..] = chars
+                 * (see esp_zb_zcl_attribute_data_t). */
+                const uint8_t *str = (const uint8_t *)var->attribute.data.value;
+                uint8_t str_len = str ? str[0] : 0;
+                ESP_LOGI(TAG, "ZCL Read Attr Response from 0x%04x: attr=0x%04x type=0x%02x value=\"%.*s\"",
+                         resp->info.src_address.u.short_addr, var->attribute.id, var->attribute.data.type,
+                         str_len, str ? (const char *)&str[1] : "");
+                continue;
+            }
+
             int32_t val = 0;
             switch (var->attribute.data.type) {
             case ESP_ZB_ZCL_ATTR_TYPE_S16:
@@ -377,7 +410,7 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
                 }
 
                 /* Debug probe: on every DP5 (local temp) report, ask the
-                 * device for a full DP dump via Data Query (cmd 0x11), to
+                 * device for a full DP dump via Data Query (cmd 0x03), to
                  * check whether it ever replies with more than one DP. Not
                  * one-shot (deliberately repeatable across DP5 reports, one
                  * every ~30-120s per observed report intervals - low enough
@@ -394,6 +427,34 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
                      * "Protocole". */
                     ESP_LOGI(TAG, "DP5 seen - sending ZCL Read Attributes (cluster 0x0201) to device 0x%04x", src_addr);
                     zcl_send_read_thermostat_attrs(src_addr, src_ep);
+
+                    /* Two more probes borrowed from zigbee-herdsman-converters'
+                     * tuyaBase() configure step (SPECIFICATIONS.md
+                     * "Protocole", "Piste explorée en parallèle"): the
+                     * "magic packet" (Basic cluster read) and an explicit
+                     * ZDO bind of the Basic cluster to this coordinator. */
+                    ESP_LOGI(TAG, "DP5 seen - sending ZCL Read Attributes (cluster 0x0000, magic packet) to device 0x%04x", src_addr);
+                    zcl_send_read_basic_attrs(src_addr, src_ep);
+
+                    const esp_zb_ieee_addr_t *ieee = find_paired_device_ieee(src_addr);
+                    if (ieee != NULL) {
+                        zdo_bind_basic_cluster(src_addr, *ieee, src_ep);
+                    } else {
+                        ESP_LOGW(TAG, "DP5 seen - skipping Basic cluster bind for 0x%04x: IEEE address unknown (device never DEVICE_ANNCE'd this gateway boot)", src_addr);
+                    }
+                }
+
+                /* Same Data Query probe as on DP5, retried here on every DP7
+                 * (child lock) report - a different trigger context (event-
+                 * driven on a button press, not on the fixed ~30-120s DP5
+                 * cadence) in case that timing/context matters. Confirmed so
+                 * far (see SPECIFICATIONS.md "Protocole", "Data Query"):
+                 * accepted with ZCL SUCCESS but no DP dump follows - this is
+                 * another data point toward the same conclusion, not
+                 * expected to behave differently. */
+                if (dp_id == KETOTEK_DP_CHILD_LOCK_REAL) {
+                    ESP_LOGI(TAG, "DP7 seen - sending TUYA Data Query to device 0x%04x", src_addr);
+                    tuya_send_data_query(src_addr, src_ep);
                 }
             } else if (cmd_id == TUYA_CMD_TIME_SYNC) {
                 ESP_LOGI(TAG, "  -> TUYA Time Sync Request (TODO: unhandled, no response sent)");
@@ -411,22 +472,18 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
     return ret;
 }
 
-/* Send TUYA DataQuery command to query device status (cmd 0x11: query all DPs). */
+/* Send TUYA Data Query command to query device status (TY_DATA_QUERY, cmd
+ * 0x03: query all DPs). Per the official Tuya Zigbee Universal Docking
+ * Access Standard, this command has NO payload at all - not even a
+ * sequence number ("The query does not contain a ZCL payload"). Previous
+ * attempts wrongly used cmd 0x11 with a 3-byte [seq_h][seq_l][0x00] payload:
+ * 0x11 is actually TUYA_MCU_VERSION_RSP (MCU firmware version), not a data
+ * query at all - that mismatch is exactly why the head only ever sent back
+ * a bare ZCL Default Response and never a DP dump. See SPECIFICATIONS.md
+ * "Protocole". */
 static void tuya_send_data_query(uint16_t dst_addr, uint8_t dst_endpoint)
 {
-    g_tuya_seq++;
-    if (g_tuya_seq >= 0xFFFF) {
-        g_tuya_seq = 0;
-    }
-
-    uint8_t tuya_query[] = {
-        (g_tuya_seq >> 8) & 0xFF,
-        g_tuya_seq & 0xFF,
-        0x00, /* query all DataPoints */
-    };
-
-    ESP_LOGI(TAG, "Sending TUYA DataQuery (seq=0x%04x) to device 0x%04x", g_tuya_seq, dst_addr);
-    ESP_LOG_BUFFER_HEX_LEVEL(TAG, tuya_query, sizeof(tuya_query), ESP_LOG_INFO);
+    ESP_LOGI(TAG, "Sending TUYA DataQuery (cmd 0x%02x, empty payload) to device 0x%04x", TUYA_CMD_QUERY, dst_addr);
 
     if (!esp_zb_bdb_dev_joined()) {
         ESP_LOGE(TAG, "Cannot send command: gateway not joined to network");
@@ -445,17 +502,14 @@ static void tuya_send_data_query(uint16_t dst_addr, uint8_t dst_endpoint)
         .custom_cmd_id = TUYA_CMD_QUERY,
         .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
         .data = {
-            /* NOT ARRAY: per the SDK doc, ARRAY/16BIT_ARRAY/32BIT_ARRAY expect
-             * the first 2 bytes of the buffer to BE a count prefix that the
-             * stack re-parses (size = 2 + sum of content len) - our raw Tuya
-             * bytes (seq number first) got misread as a huge count, inflating
-             * the computed frame size until NWK silently dropped it as
-             * "too big" (confirmed via a low-level APS trace capture on
-             * real hardware: buf_len 261/517/773 for 7-10 byte payloads).
-             * SET has no such prefix - size is just the raw byte count. */
+            /* Zero-length payload per the official spec - see the function
+             * comment above. .type/.value are irrelevant with .size = 0,
+             * but SET (not ARRAY) is used for consistency with every other
+             * Tuya send in this file - see the matching comment on
+             * tuya_send_set_dp_temperature() for why ARRAY is avoided. */
             .type = ESP_ZB_ZCL_ATTR_TYPE_SET,
-            .value = tuya_query,
-            .size = sizeof(tuya_query),
+            .value = NULL,
+            .size = 0,
         },
     };
 
@@ -503,6 +557,81 @@ static void zcl_send_read_thermostat_attrs(uint16_t dst_addr, uint8_t dst_endpoi
     } else {
         ESP_LOGI(TAG, "Read Attributes sent successfully (tx_seq=0x%02x)", tx_seq);
     }
+}
+
+/* Send a standard ZCL Read Attributes request on the Basic cluster (0x0000) -
+ * the "magic packet" zigbee-herdsman-converters sends to every Tuya device at
+ * configure time (configureMagicPacket, always run via tuyaBase()), some of
+ * which reportedly need it to start behaving normally after joining. Reuses
+ * the same generic ESP_ZB_CORE_CMD_READ_ATTR_RESP_CB_ID handler as
+ * zcl_send_read_thermostat_attrs() above. See SPECIFICATIONS.md "Protocole". */
+static void zcl_send_read_basic_attrs(uint16_t dst_addr, uint8_t dst_endpoint)
+{
+    static uint16_t attr_field[] = {
+        ESP_ZB_ZCL_ATTR_BASIC_ZCL_VERSION_ID,
+        ESP_ZB_ZCL_ATTR_BASIC_APPLICATION_VERSION_ID,
+        ESP_ZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID,
+        ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID,
+        ESP_ZB_ZCL_ATTR_BASIC_POWER_SOURCE_ID,
+        0xfffe,
+    };
+
+    if (!esp_zb_bdb_dev_joined()) {
+        ESP_LOGE(TAG, "Cannot send command: gateway not joined to network");
+        return;
+    }
+
+    esp_zb_zcl_read_attr_cmd_t read_req = {
+        .zcl_basic_cmd = {
+            .dst_addr_u.addr_short = dst_addr,
+            .dst_endpoint = dst_endpoint,
+            .src_endpoint = ESP_ZB_GATEWAY_ENDPOINT,
+        },
+        .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .clusterID = ESP_ZB_ZCL_CLUSTER_ID_BASIC,
+        .attr_number = sizeof(attr_field) / sizeof(attr_field[0]),
+        .attr_field = attr_field,
+    };
+
+    uint8_t tx_seq = esp_zb_zcl_read_attr_cmd_req(&read_req);
+    if (tx_seq == 0xFF) {
+        ESP_LOGE(TAG, "Failed to send Basic Read Attributes (magic packet): stack rejected command");
+    } else {
+        ESP_LOGI(TAG, "Basic Read Attributes (magic packet) sent successfully (tx_seq=0x%02x)", tx_seq);
+    }
+}
+
+/* ZDO bind callback for zdo_bind_basic_cluster() below - just logs the
+ * result, no further action taken. */
+static void zdo_bind_basic_cluster_cb(esp_zb_zdp_status_t zdo_status, void *user_ctx)
+{
+    uint16_t short_addr = (uint16_t)(uintptr_t)user_ctx;
+    ESP_LOGI(TAG, "ZDO bind (Basic cluster) result for device 0x%04x: status=0x%02x", short_addr, zdo_status);
+}
+
+/* Explicitly bind the device's Basic cluster (0x0000) to this coordinator -
+ * the other half of zigbee-herdsman-converters' tuyaBase({bindBasicOnConfigure:
+ * true}), used by the real Saswell/KETOTEK converter. Our gateway never binds
+ * anything explicitly today (devices are just registered on DEVICE_ANNCE), so
+ * this is untested territory. Needs the device's IEEE address - see
+ * find_paired_device_ieee(). See SPECIFICATIONS.md "Protocole". */
+static void zdo_bind_basic_cluster(uint16_t dst_short_addr, const esp_zb_ieee_addr_t dst_ieee_addr, uint8_t dst_endpoint)
+{
+    esp_zb_ieee_addr_t coordinator_ieee;
+    esp_zb_get_long_address(coordinator_ieee);
+
+    esp_zb_zdo_bind_req_param_t bind_req = {
+        .src_endp = dst_endpoint,
+        .cluster_id = ESP_ZB_ZCL_CLUSTER_ID_BASIC,
+        .dst_addr_mode = ESP_ZB_ZDO_BIND_DST_ADDR_MODE_64_BIT_EXTENDED,
+        .dst_endp = ESP_ZB_GATEWAY_ENDPOINT,
+        .req_dst_addr = dst_short_addr,
+    };
+    memcpy(bind_req.src_address, dst_ieee_addr, sizeof(esp_zb_ieee_addr_t));
+    memcpy(bind_req.dst_address_u.addr_long, coordinator_ieee, sizeof(esp_zb_ieee_addr_t));
+
+    ESP_LOGI(TAG, "Sending ZDO bind request (Basic cluster) to device 0x%04x", dst_short_addr);
+    esp_zb_zdo_device_bind_req(&bind_req, zdo_bind_basic_cluster_cb, (void *)(uintptr_t)dst_short_addr);
 }
 
 /* Send a single TUYA "Set DataPoint" (cmd 0x00) frame writing a x10-encoded
@@ -683,6 +812,8 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
              * demo setpoint below via the existing device. */
         } else if (g_paired_devices_count < MAX_PAIRED_DEVICES) {
             g_paired_devices[g_paired_devices_count].short_addr = dev_annce_params->device_short_addr;
+            memcpy(g_paired_devices[g_paired_devices_count].ieee_addr, dev_annce_params->ieee_addr, sizeof(esp_zb_ieee_addr_t));
+            g_paired_devices[g_paired_devices_count].ieee_addr_known = true;
             g_paired_devices[g_paired_devices_count].endpoint = 1;
             snprintf(g_paired_devices[g_paired_devices_count].model, sizeof(g_paired_devices[g_paired_devices_count].model), "Device_%d", g_paired_devices_count + 1);
             g_paired_devices_count++;

@@ -95,26 +95,55 @@ Le round-trip DP103 est resté silencieux (aucune erreur, mais rien reçu) penda
 
 ### Commandes du cluster (`custom_cmd_id`)
 
-| Cmd | Constante | Direction | Usage observé |
-|---|---|---|---|
-| `0x00` | `TUYA_CMD_SET_DATA` | gateway → device | Écrire un DP (ex: consigne DP103) |
-| `0x01` | `TUYA_CMD_REPORT_1` | device → gateway | Rapport spontané (utilisé par le simulateur `/thermostat`) |
-| `0x02` | `TUYA_CMD_REPORT_2` | device → gateway | Rapport spontané observé sur le vrai KTF0177 |
-| `0x11` | `TUYA_CMD_QUERY` | gateway → device | Requête "tous les DP" — **testée sur le réel, acceptée mais sans effet** (voir "Data Query" ci-dessous) |
-| `0x24` | `TUYA_CMD_TIME_SYNC` | device → gateway | Requête de synchro horaire — reçue mais non traitée (TODO) |
+Table corrigée d'après la doc officielle Tuya (*Tuya Zigbee Universal Docking Access Standard*, developer.tuya.com/en/docs/iot/tuya-zigbee-universal-docking-access-standard?id=K9ik6zvofpzql) — voir "Erreur historique sur `0x11`" plus bas pour l'ancienne table erronée.
+
+| Cmd | Constante | Nom officiel | Direction | Usage observé |
+|---|---|---|---|---|
+| `0x00` | `TUYA_CMD_SET_DATA` | `TY_DATA_REQUEST` | gateway → device | Écrire un DP (ex: consigne DP4/DP103) |
+| `0x01` | `TUYA_CMD_REPORT_1` | `TY_DATA_RESPONE` | device → gateway | Réponse à une requête de données (utilisé par le simulateur `/thermostat` pour ses rapports) |
+| `0x02` | `TUYA_CMD_REPORT_2` | `TY_DATA_REPORT` | device → gateway | Rapport spontané, bidirectionnel — observé sur le vrai KTF0177 |
+| `0x03` | `TUYA_CMD_QUERY` | `TY_DATA_QUERY` | gateway → device | Requête "tous les DP", payload **vide** (pas même de numéro de séquence) — voir "Data Query" ci-dessous |
+| `0x10` | `TUYA_CMD_MCU_VERSION_REQ` | `TUYA_MCU_VERSION_REQ` | gateway → device | Requête version firmware MCU — non utilisée |
+| `0x11` | `TUYA_CMD_MCU_VERSION_RSP` | `TUYA_MCU_VERSION_RSP` | device → gateway | Réponse/rapport version firmware MCU — **PAS un data query**, voir plus bas |
+| `0x24` | `TUYA_CMD_TIME_SYNC` | `TUYA_MCU_SYNC_TIME` | device → gateway | Requête de synchro horaire — reçue mais non traitée (TODO) |
 
 ### Types de données (`DP_TYPE`)
 
 `0x01` Bool (1 byte) · `0x02` Value (int32 big-endian, 4 bytes) · `0x03` String · `0x04` Enum (1 byte) · `0x05` Bitmap.
 
-### Data Query (`0x11`) — testée sur le réel, n'apporte pas de dump complet
+### Erreur historique sur `0x11` — corrigée le 2026-08-09
 
-`old/TUYA_ZIGBEE_PROTOCOL.md` prédit qu'une requête `0x11` fait répondre le device avec tous ses DP (commande `0x01` ou `0x02`). Testé sur le KTF0177 réel (`gateway/main/esp_zigbee_gateway.c`, probe de debug déclenchée à chaque rapport DP5 — voir `tuya_send_data_query()`) :
+Le code (et `old/TUYA_ZIGBEE_PROTOCOL.md`) utilisaient `0x11` comme "Data Query" avec un payload `[SEQ_H][SEQ_L][0x00]`. **C'était une erreur** : d'après la doc officielle Tuya ci-dessus, `0x11` est en fait `TUYA_MCU_VERSION_RSP` (rapport de version firmware MCU), sans aucun rapport avec une requête de données. La vraie commande "query all DPs" est **`0x03`** (`TY_DATA_QUERY`), avec un payload **entièrement vide** ("*does not contain a ZCL payload*").
 
-* La tête répond par une **ZCL Default Response** standard (`ESP_ZB_CORE_CMD_DEFAULT_RESP_CB_ID = 0x1005`, décodée dans `zb_action_handler()`), avec `resp_to_cmd=0x11 status=0x00 (SUCCESS)` — la commande est donc **comprise et acceptée**, pas rejetée comme "cluster non supporté".
-* Même comportement observé pour `TUYA_CMD_SET_DATA (0x00)` : `resp_to_cmd=0x00 status=0x00 (SUCCESS)` — c'est la tête qui accuse simplement réception au niveau ZCL (`disableDefaultResponse` non positionné côté gateway), indépendamment du contenu Tuya de la commande.
-* **Mais aucune rafale de DP ne suit** cet accusé de réception. La tête continue son cycle de rapports spontanés habituel (un DP à la fois, à son propre rythme). Conclusion actuelle : sur ce device/firmware, `0x11` est un no-op fonctionnel côté Tuya malgré l'ack ZCL positif — pas de moyen connu de forcer un dump d'état complet à la demande, seulement d'attendre les rapports spontanés DP par DP.
-* Probe de test laissée active dans le code (déclenchée sur DP5) au cas où ce comportement varierait (reboot de la tête, mise à jour firmware, etc.).
+Ça explique complètement le comportement observé sur le matériel réel : la tête acquittait poliment une trame ZCL bien formée (`Default Response status=SUCCESS`) sans jamais renvoyer de données, parce qu'elle ne recevait tout simplement pas la bonne commande — `0x11` n'a jamais eu vocation à déclencher un dump d'état.
+
+Corrigé dans `tuya_ketotek_dp.h` (les deux copies) et `tuya_send_data_query()` (`gateway/main/esp_zigbee_gateway.c`) : commande `0x03`, payload vide (`.size = 0`).
+
+**Retesté sur le matériel réel (2026-08-09) avec la commande corrigée : même résultat que `0x11`** — `ZCL Default Response status=SUCCESS`, aucune donnée ne suit, déclenché sur DP7. La correction de commande n'a donc pas débloqué de dump.
+
+**Conclusion révisée et renforcée** : ce n'était pas un problème de mauvaise commande — recoupé avec l'observation indépendante sur zigbee2mqtt (le converter Saswell mature n'utilise jamais `dataQuery` pour cette famille de devices, voir section suivante), tout indique que **ce firmware MCU (TRV Saswell bon marché, dont ce KETOTEK rebadgé) n'implémente simplement pas la fonctionnalité "query" côté device**, même si la commande existe dans la spec Tuya générique. Piste `0x03` fermée. Reste à tenter, si besoin : magic packet (lecture Basic cluster) et bind explicite (voir ci-dessous) — sinon, la seule source d'information fiable est les rapports spontanés DP par DP (cache d'état local, Option 1 déjà discutée).
+
+### Piste explorée en parallèle : `configure()` de zigbee-herdsman-converters
+
+Le converter Saswell mature (`old/documentation/zigbee-herdsman-converters/src/devices/saswell.ts`, `tuya.modernExtend.tuyaBase({bindBasicOnConfigure: true, timeStart: "1970"})`) n'active **ni** `queryOnConfigure` ni `queryOnDeviceAnnounce` — il ne fait jamais de data query, juste :
+* `configureMagicPacket` (toujours actif) : lecture ZCL standard du cluster **Basic (`0x0000`)** — `manufacturerName`, `zclVersion`, `appVersion`, `modelId`, `powerSource`, attribut `0xfffe`. Jamais testé côté gateway (on a testé Thermostat `0x0201`, pas Basic).
+* `bindBasicOnConfigure: true` : bind ZDO explicite du cluster Basic vers le coordinateur. Jamais fait côté gateway (le device est juste enregistré au `DEVICE_ANNCE`, sans bind explicite).
+* Réponse à `commandMcuSyncTime` (cmd `0x24`) avec l'heure — recoupe notre TODO connu (Time Sync non implémenté).
+
+**Magic packet testé sur le réel (2026-08-09) : ✅ réponse complète, contrairement au cluster Thermostat.** `zcl_send_read_basic_attrs()` (`gateway/main/esp_zigbee_gateway.c`), déclenché sur DP5 :
+
+| Attr | Nom | Type | Valeur |
+|---|---|---|---|
+| `0x0000` | zclVersion | U8 | `3` |
+| `0x0001` | applicationVersion | U8 | `67` (`0x43`) |
+| `0x0004` | manufacturerName | String | (décodage string ajouté après ce premier test, à relire au prochain DP5) |
+| `0x0005` | modelIdentifier | String | idem |
+| `0x0007` | powerSource | Enum | `3` = Battery |
+| `0xfffe` | (spécifique fabricant) | Enum | `0` |
+
+Contrairement au cluster Thermostat `0x0201` (silence total, voir ci-dessous), **le cluster Basic `0x0000` répond bien avec de vraies données** — la tête n'ignore donc pas tout le ZCL standard, juste les clusters HA non réellement câblés sur son firmware Tuya (Thermostat, et `0x03`/Data Query côté cluster propriétaire). Reste à lire `manufacturerName`/`modelIdentifier` en clair (décodage string ajouté dans `zb_action_handler()`, pas encore vérifié sur le device) — pourrait aider à identifier précisément le firmware/la révision.
+
+**Bind explicite** (`zdo_bind_basic_cluster()`) : pas encore testé — nécessite l'adresse IEEE du device, connue seulement après un `DEVICE_ANNCE` pendant le boot courant de la gateway (voir `find_paired_device_ieee()`). En attente d'un ré-appairage/re-announce pour tester.
 
 ### ZCL Read Attributes (cluster `0x0201`) — testé sur le réel, échec (silence)
 
@@ -122,7 +151,7 @@ Alternative tentée au Data Query Tuya : lecture standard ZCL `Read Attributes` 
 
 * **Aucune réponse** de la tête — ni `ZCL Read Attr Response` (`ESP_ZB_CORE_CMD_READ_ATTR_RESP_CB_ID`), ni même un `Default Response` d'erreur (confirmé en ajoutant le cluster au log du Default Response : seuls `0xef00`/`0x00` et `0xef00`/`0x11` reviennent, jamais `0x0201`).
 * Conclusion : le cluster `0x0201` est probablement déclaré par la tête uniquement pour la compatibilité profil HA, sans être réellement câblé sur des données vivantes — le firmware Tuya ne répond que sur son cluster propriétaire `0xEF00`.
-* **Pas de piste de lecture "pull" fonctionnelle identifiée à ce jour** (ni `0x11` sur `0xEF00`, ni ZCL standard sur `0x0201`) — la seule source d'information fiable reste les rapports spontanés DP par DP.
+* Pas de piste de lecture "pull" fonctionnelle confirmée à ce jour côté ZCL standard (`0x0201`) — mais voir "Erreur historique sur `0x11`" plus haut : la commande Tuya `0x03` (`TY_DATA_QUERY`), pas encore testée avec le bon payload, reste une piste ouverte côté cluster `0xEF00`.
 
 ## DataPoints confirmés (table Saswell/KETOTEK)
 
