@@ -3,9 +3,6 @@
  * table, shared between /gateway and /thermostat.
  *
  * Keep in sync with the identical copy in ../../thermostat/main/tuya_ketotek_dp.h.
- * See SPECIFICATIONS.md and old/ZIGBEE2MQTT_ANALYSIS.md for the origin of this
- * DP103-based table (reverse-engineered from the real KETOTEK KTF0177 by the
- * zigbee-herdsman-converters Saswell converter - NOT the old/ DP04 guess).
  *
  * Wire format for cluster 0xEF00 custom commands:
  *   [SEQ_H][SEQ_L][DP_ID][DP_TYPE][LEN_H][LEN_L][DATA...]
@@ -38,46 +35,42 @@ typedef enum {
     TUYA_DP_TYPE_BITMAP = 0x05,
 } tuya_dp_type_t;
 
-/* KETOTEK KTF0177 DataPoints (DP103 scheme, per zigbee-herdsman-converters
- * Saswell/KETOTEK - see old/ZIGBEE2MQTT_ANALYSIS.md) */
-#define KETOTEK_DP_CONTROL_MODE          2   /* enum, 1 byte - not in the Saswell table,
-                                               * identified on real hardware: middle
-                                               * button mode toggle, 0=Automatique,
-                                               * 1=Manuel (see SPECIFICATIONS.md
-                                               * "Protocole") */
-#define KETOTEK_DP_HEATING_STATE        3   /* enum */
-#define KETOTEK_DP_HEATING_SETPOINT_ECHO 4   /* value, x10 C - not in the Saswell
-                                               * table, identified on real hardware:
-                                               * mirrors the setpoint currently applied
-                                               * on the head, including manual changes
-                                               * made on the device itself (see
-                                               * SPECIFICATIONS.md "Protocole") */
-#define KETOTEK_DP_LOCAL_TEMP_REAL      5   /* value, x10 C - not in the Saswell
-                                              * table (which uses DP102, never
-                                              * observed on this device); confirmed
-                                              * on real hardware, matches the
-                                              * temperature shown on the head's
-                                              * screen. See SPECIFICATIONS.md
-                                              * "Protocole". */
-#define KETOTEK_DP_CHILD_LOCK_REAL      7   /* bool - not in the Saswell table
-                                              * (which uses DP40, never observed on
-                                              * this device); confirmed on real
-                                              * hardware by toggling the child lock
-                                              * and observing this DP flip ON/OFF.
-                                              * See SPECIFICATIONS.md "Protocole". */
-#define KETOTEK_DP_WINDOW_DETECTION     8   /* bool */
-#define KETOTEK_DP_FROST_DETECTION      10  /* bool */
-#define KETOTEK_DP_TEMP_CALIBRATION     27  /* value, signed, -6..+6 C */
-#define KETOTEK_DP_CHILD_LOCK           40  /* bool */
-#define KETOTEK_DP_SYSTEM_STATE         101 /* bool: on/off */
-#define KETOTEK_DP_LOCAL_TEMP           102 /* value, x10 C */
-#define KETOTEK_DP_HEATING_SETPOINT     103 /* value, x10 C */
-#define KETOTEK_DP_VALVE_POSITION       104 /* value, 0-100% */
-#define KETOTEK_DP_BATTERY_LOW          105 /* bool */
-#define KETOTEK_DP_AWAY_MODE            106 /* bool */
-#define KETOTEK_DP_SCHEDULE_MODE        107 /* enum */
-#define KETOTEK_DP_SCHEDULE_ENABLE      108 /* bool */
-#define KETOTEK_DP_WEEKLY_SCHEDULE_BASE 109 /* + 123..129, raw schedule bytes */
+/* KETOTEK KTF0177 DataPoints.
+ *
+ * This table is CONFIRMED: the real device's Basic cluster (0x0000) reports
+ * manufacturerName="_TZE200_p3dbf6qs", modelIdentifier="TS0601" (read via
+ * zcl_send_read_basic_attrs(), the "magic packet" probe - see
+ * SPECIFICATIONS.md "Protocole"). That fingerprint is an exact match in
+ * zigbee-herdsman-converters (old/documentation/zigbee-herdsman-converters/
+ * src/devices/tuya.ts) for model "TS0601_thermostat_5", white-labelled as
+ * "AVATTO ME167_1" - i.e. this KETOTEK-branded head is a rebadged AVATTO
+ * ME167_1, NOT a Saswell/SEA801-802 device as previously assumed by
+ * similarity. Table below is that converter's meta.tuyaDatapoints, taken
+ * as ground truth (2026-08-09) - replaces the earlier Saswell-based guess
+ * entirely. DP4/5/7 were already independently confirmed by hand on real
+ * hardware before this was found; this source confirms them exactly and
+ * adds the rest. */
+#define KETOTEK_DP_SYSTEM_MODE            2   /* enum: auto=0, heat=1, off=2 */
+#define KETOTEK_DP_RUNNING_STATE          3   /* enum: heat=0 (actively heating), idle=1 */
+#define KETOTEK_DP_HEATING_SETPOINT       4   /* value, x10 C - read AND write (confirmed
+                                                * on real hardware: writing this DP moves
+                                                * the setpoint shown on the head's screen) */
+#define KETOTEK_DP_LOCAL_TEMP             5   /* value, x10 C - confirmed on real hardware,
+                                                * matches the temperature shown on screen */
+#define KETOTEK_DP_CHILD_LOCK             7   /* bool - confirmed on real hardware by
+                                                * toggling the child lock */
+#define KETOTEK_DP_SCHEDULE_WEDNESDAY     28  /* raw schedule bytes, not decoded */
+#define KETOTEK_DP_SCHEDULE_THURSDAY      29  /* raw schedule bytes, not decoded */
+#define KETOTEK_DP_SCHEDULE_FRIDAY        30  /* raw schedule bytes, not decoded */
+#define KETOTEK_DP_SCHEDULE_SATURDAY      31  /* raw schedule bytes, not decoded */
+#define KETOTEK_DP_SCHEDULE_SUNDAY        32  /* raw schedule bytes, not decoded */
+#define KETOTEK_DP_SCHEDULE_MONDAY        33  /* raw schedule bytes, not decoded */
+#define KETOTEK_DP_SCHEDULE_TUESDAY       34  /* raw schedule bytes, not decoded */
+#define KETOTEK_DP_ERROR_OR_BATTERY_LOW   35  /* composite/raw, not decoded */
+#define KETOTEK_DP_FROST_PROTECTION       36  /* bool */
+#define KETOTEK_DP_SCALE_PROTECTION       39  /* bool - anti-scaling auto-flush ("Ad" on screen) */
+#define KETOTEK_DP_LOCAL_TEMP_CALIBRATION 47  /* value, signed */
+#define KETOTEK_DP_PI_HEATING_DEMAND      101 /* raw - valve modulation, likely 0-100% */
 
 /* Minimum frame length for a DP report/set payload: 2 (seq) + 1 (dp_id) +
  * 1 (dp_type) + 2 (len) = 6 bytes before the DP's own data. */

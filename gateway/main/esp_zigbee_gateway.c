@@ -122,10 +122,11 @@ static void demo_setpoint_mark_sent(uint16_t short_addr)
     }
 }
 
-/* Debug probe: fire a TUYA Data Query (cmd 0x11, see old/TUYA_ZIGBEE_PROTOCOL.md
- * "Commande 0x11") on every DP5 (KETOTEK_DP_LOCAL_TEMP_REAL) report, to check
- * whether the real KTF0177 ever replies with more than one DP. Deliberately
- * repeatable, not one-shot - see the call site in zb_action_handler(). */
+/* Debug probe: fire a TUYA Data Query (cmd 0x03, TY_DATA_QUERY - see
+ * SPECIFICATIONS.md "Protocole") on every DP5 (KETOTEK_DP_LOCAL_TEMP)
+ * report, to check whether the real KTF0177 ever replies with more than one
+ * DP. Deliberately repeatable, not one-shot - see the call site in
+ * zb_action_handler(). */
 
 static void tuya_send_set_temperature(uint16_t dst_addr, uint8_t dst_endpoint, int16_t temperature_deg);
 static void tuya_send_data_query(uint16_t dst_addr, uint8_t dst_endpoint);
@@ -174,92 +175,75 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
 static void tuya_log_dp(uint8_t dp_id, uint8_t dp_type, uint16_t dp_len, const uint8_t *dp_data)
 {
     switch (dp_id) {
-    case KETOTEK_DP_CONTROL_MODE:
-        /* Not in the documented Saswell/KETOTEK table - identified on real
-         * hardware: toggled by the head's middle button, confirmed
-         * 0=Automatique / 1=Manuel. See SPECIFICATIONS.md "Protocole". */
-        ESP_LOGI(TAG, "  DP%u (ControlMode/enum): %s", dp_id, (dp_len >= 1 && dp_data[0]) ? "Manuel" : "Automatique");
+    case KETOTEK_DP_SYSTEM_MODE: {
+        /* enum: auto=0, heat=1, off=2 (zigbee-herdsman-converters ground
+         * truth - see tuya_ketotek_dp.h). Only 0/1 observed on real
+         * hardware so far, via the middle button. See SPECIFICATIONS.md
+         * "Protocole". */
+        uint8_t v = dp_len >= 1 ? dp_data[0] : 0xFF;
+        const char *name = (v == 0) ? "Auto" : (v == 1) ? "Heat" : (v == 2) ? "Off" : "?";
+        ESP_LOGI(TAG, "  DP%u (SystemMode/enum): %u (%s)", dp_id, v, name);
         break;
-    case KETOTEK_DP_CHILD_LOCK_REAL:
-        /* Not in the documented Saswell/KETOTEK table (which uses DP40,
-         * never observed on this device) - confirmed on real hardware by
-         * toggling the child lock. See SPECIFICATIONS.md "Protocole". */
-        ESP_LOGI(TAG, "  DP%u (ChildLock/bool): %s", dp_id, (dp_len >= 1 && dp_data[0]) ? "ON" : "OFF");
+    }
+    case KETOTEK_DP_RUNNING_STATE: {
+        /* enum: heat=0 (actively heating), idle=1. Never observed on real
+         * hardware yet. */
+        uint8_t v = dp_len >= 1 ? dp_data[0] : 0xFF;
+        ESP_LOGI(TAG, "  DP%u (RunningState/enum): %u (%s)", dp_id, v, v == 0 ? "Heat" : v == 1 ? "Idle" : "?");
         break;
-    case KETOTEK_DP_LOCAL_TEMP_REAL:
-        /* Not in the documented Saswell/KETOTEK table (which uses DP102,
-         * never observed on this device) - confirmed on real hardware,
-         * matches the temperature shown on the head's screen. See
-         * SPECIFICATIONS.md "Protocole". */
-        if (dp_len == 4) {
-            ESP_LOGI(TAG, "  DP%u (LocalTemp/value): %.1f C", dp_id, tuya_dp_decode_value(dp_data) / 10.0);
-        }
-        break;
-    case KETOTEK_DP_HEATING_STATE:
-        ESP_LOGI(TAG, "  DP%u (HeatingState/enum): %u", dp_id, dp_len >= 1 ? dp_data[0] : 0);
-        break;
-    case KETOTEK_DP_HEATING_SETPOINT_ECHO:
-        /* Not in the documented Saswell/KETOTEK table - identified on real
-         * hardware: tracks the setpoint currently applied on the head,
-         * confirmed by echoing a setpoint changed manually on the device
-         * itself. See SPECIFICATIONS.md "Protocole". */
-        if (dp_len == 4) {
-            ESP_LOGI(TAG, "  DP%u (HeatingSetpointEcho/value): %.1f C", dp_id, tuya_dp_decode_value(dp_data) / 10.0);
-        }
-        break;
-    case KETOTEK_DP_WINDOW_DETECTION:
-        ESP_LOGI(TAG, "  DP%u (WindowDetection/bool): %s", dp_id, (dp_len >= 1 && dp_data[0]) ? "ON" : "OFF");
-        break;
-    case KETOTEK_DP_FROST_DETECTION:
-        ESP_LOGI(TAG, "  DP%u (FrostDetection/bool): %s", dp_id, (dp_len >= 1 && dp_data[0]) ? "ON" : "OFF");
-        break;
-    case KETOTEK_DP_TEMP_CALIBRATION:
-        if (dp_len == 4) {
-            ESP_LOGI(TAG, "  DP%u (TempCalibration/value): %d", dp_id, (int)tuya_dp_decode_value(dp_data));
-        } else if (dp_len >= 1) {
-            ESP_LOGI(TAG, "  DP%u (TempCalibration/value, 1B): %d", dp_id, (int8_t)dp_data[0]);
-        }
-        break;
-    case KETOTEK_DP_CHILD_LOCK:
-        ESP_LOGI(TAG, "  DP%u (ChildLock/bool): %s", dp_id, (dp_len >= 1 && dp_data[0]) ? "ON" : "OFF");
-        break;
-    case KETOTEK_DP_SYSTEM_STATE:
-        ESP_LOGI(TAG, "  DP%u (SystemState/bool): %s", dp_id, (dp_len >= 1 && dp_data[0]) ? "ON" : "OFF");
-        break;
-    case KETOTEK_DP_LOCAL_TEMP:
-        if (dp_len == 4) {
-            ESP_LOGI(TAG, "  DP%u (LocalTemp/value): %.1f C", dp_id, tuya_dp_decode_value(dp_data) / 10.0);
-        }
-        break;
+    }
     case KETOTEK_DP_HEATING_SETPOINT:
+        /* Confirmed on real hardware: writing this DP moves the setpoint
+         * shown on the head's screen. */
         if (dp_len == 4) {
             ESP_LOGI(TAG, "  DP%u (HeatingSetpoint/value): %.1f C", dp_id, tuya_dp_decode_value(dp_data) / 10.0);
         }
         break;
-    case KETOTEK_DP_VALVE_POSITION:
+    case KETOTEK_DP_LOCAL_TEMP:
+        /* Confirmed on real hardware, matches the temperature shown on the
+         * head's screen. */
         if (dp_len == 4) {
-            ESP_LOGI(TAG, "  DP%u (ValvePosition/value): %d%%", dp_id, (int)tuya_dp_decode_value(dp_data));
+            ESP_LOGI(TAG, "  DP%u (LocalTemp/value): %.1f C", dp_id, tuya_dp_decode_value(dp_data) / 10.0);
         }
         break;
-    case KETOTEK_DP_BATTERY_LOW:
-        ESP_LOGI(TAG, "  DP%u (BatteryLow/bool): %s", dp_id, (dp_len >= 1 && dp_data[0]) ? "LOW" : "OK");
+    case KETOTEK_DP_CHILD_LOCK:
+        /* Confirmed on real hardware by toggling the child lock. */
+        ESP_LOGI(TAG, "  DP%u (ChildLock/bool): %s", dp_id, (dp_len >= 1 && dp_data[0]) ? "ON" : "OFF");
         break;
-    case KETOTEK_DP_AWAY_MODE:
-        ESP_LOGI(TAG, "  DP%u (AwayMode/bool): %s", dp_id, (dp_len >= 1 && dp_data[0]) ? "ON" : "OFF");
+    case KETOTEK_DP_SCHEDULE_WEDNESDAY:
+    case KETOTEK_DP_SCHEDULE_THURSDAY:
+    case KETOTEK_DP_SCHEDULE_FRIDAY:
+    case KETOTEK_DP_SCHEDULE_SATURDAY:
+    case KETOTEK_DP_SCHEDULE_SUNDAY:
+    case KETOTEK_DP_SCHEDULE_MONDAY:
+    case KETOTEK_DP_SCHEDULE_TUESDAY:
+        ESP_LOGI(TAG, "  DP%u (WeeklySchedule): %u raw bytes (not decoded)", dp_id, dp_len);
         break;
-    case KETOTEK_DP_SCHEDULE_MODE:
-        ESP_LOGI(TAG, "  DP%u (ScheduleMode/enum): %u", dp_id, dp_len >= 1 ? dp_data[0] : 0);
+    case KETOTEK_DP_ERROR_OR_BATTERY_LOW:
+        ESP_LOGI(TAG, "  DP%u (ErrorOrBatteryLow): %u raw bytes (not decoded)", dp_id, dp_len);
         break;
-    case KETOTEK_DP_SCHEDULE_ENABLE:
-        ESP_LOGI(TAG, "  DP%u (ScheduleEnable/bool): %s", dp_id, (dp_len >= 1 && dp_data[0]) ? "ON" : "OFF");
+    case KETOTEK_DP_FROST_PROTECTION:
+        ESP_LOGI(TAG, "  DP%u (FrostProtection/bool): %s", dp_id, (dp_len >= 1 && dp_data[0]) ? "ON" : "OFF");
+        break;
+    case KETOTEK_DP_SCALE_PROTECTION:
+        ESP_LOGI(TAG, "  DP%u (ScaleProtection/bool): %s", dp_id, (dp_len >= 1 && dp_data[0]) ? "ON" : "OFF");
+        break;
+    case KETOTEK_DP_LOCAL_TEMP_CALIBRATION:
+        if (dp_len == 4) {
+            ESP_LOGI(TAG, "  DP%u (LocalTempCalibration/value): %d", dp_id, (int)tuya_dp_decode_value(dp_data));
+        } else if (dp_len >= 1) {
+            ESP_LOGI(TAG, "  DP%u (LocalTempCalibration/value, 1B): %d", dp_id, (int8_t)dp_data[0]);
+        }
+        break;
+    case KETOTEK_DP_PI_HEATING_DEMAND:
+        if (dp_len == 4) {
+            ESP_LOGI(TAG, "  DP%u (PiHeatingDemand/raw): %d", dp_id, (int)tuya_dp_decode_value(dp_data));
+        } else {
+            ESP_LOGI(TAG, "  DP%u (PiHeatingDemand): %u raw bytes (not decoded)", dp_id, dp_len);
+        }
         break;
     default:
-        if (dp_id == KETOTEK_DP_WEEKLY_SCHEDULE_BASE || (dp_id >= 123 && dp_id <= 129)) {
-            /* Weekly schedule DP - raw bytes only for this pass, no decode/write support yet. */
-            ESP_LOGI(TAG, "  DP%u (WeeklySchedule): %u raw bytes (not decoded)", dp_id, dp_len);
-        } else {
-            ESP_LOGI(TAG, "  DP%u: type=%u len=%u (unhandled)", dp_id, dp_type, dp_len);
-        }
+        ESP_LOGI(TAG, "  DP%u: type=%u len=%u (unhandled)", dp_id, dp_type, dp_len);
         break;
     }
 }
@@ -400,11 +384,11 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
                     demo_setpoint_mark_sent(src_addr);
                 }
 
-                /* On every DP2 (control mode) report, (re)send the heating
-                 * setpoint. Not gated on the mode's value (Manuel/Auto) nor
+                /* On every DP2 (system_mode: auto/heat/off) report, (re)send
+                 * the heating setpoint. Not gated on the mode's value nor
                  * one-shot - fires on every DP2 report, same repeatable
                  * pattern as the DP5 probe below. */
-                if (dp_id == KETOTEK_DP_CONTROL_MODE) {
+                if (dp_id == KETOTEK_DP_SYSTEM_MODE) {
                     ESP_LOGI(TAG, "DP2 seen - sending TUYA Setpoint (%d C) to device 0x%04x", DEMO_HEATING_SETPOINT_DEG, src_addr);
                     tuya_send_set_temperature(src_addr, src_ep, DEMO_HEATING_SETPOINT_DEG);
                 }
@@ -415,7 +399,7 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
                  * one-shot (deliberately repeatable across DP5 reports, one
                  * every ~30-120s per observed report intervals - low enough
                  * rate to be a non-issue for the device or network). */
-                if (dp_id == KETOTEK_DP_LOCAL_TEMP_REAL) {
+                if (dp_id == KETOTEK_DP_LOCAL_TEMP) {
                     ESP_LOGI(TAG, "DP5 seen - sending TUYA Data Query to device 0x%04x", src_addr);
                     tuya_send_data_query(src_addr, src_ep);
 
@@ -452,7 +436,7 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
                  * accepted with ZCL SUCCESS but no DP dump follows - this is
                  * another data point toward the same conclusion, not
                  * expected to behave differently. */
-                if (dp_id == KETOTEK_DP_CHILD_LOCK_REAL) {
+                if (dp_id == KETOTEK_DP_CHILD_LOCK) {
                     ESP_LOGI(TAG, "DP7 seen - sending TUYA Data Query to device 0x%04x", src_addr);
                     tuya_send_data_query(src_addr, src_ep);
                 }
@@ -610,11 +594,13 @@ static void zdo_bind_basic_cluster_cb(esp_zb_zdp_status_t zdo_status, void *user
 }
 
 /* Explicitly bind the device's Basic cluster (0x0000) to this coordinator -
- * the other half of zigbee-herdsman-converters' tuyaBase({bindBasicOnConfigure:
- * true}), used by the real Saswell/KETOTEK converter. Our gateway never binds
- * anything explicitly today (devices are just registered on DEVICE_ANNCE), so
- * this is untested territory. Needs the device's IEEE address - see
- * find_paired_device_ieee(). See SPECIFICATIONS.md "Protocole". */
+ * zigbee-herdsman-converters' tuyaBase({bindBasicOnConfigure: true}) option,
+ * borrowed from the (unrelated - see tuya_ketotek_dp.h) Saswell converter;
+ * the real converter for this device (AVATTO ME167_1 / TS0601_thermostat_5)
+ * does NOT set this flag, so it's a speculative extra try, not a confirmed
+ * requirement. Our gateway never binds anything explicitly otherwise
+ * (devices are just registered on DEVICE_ANNCE). Needs the device's IEEE
+ * address - see find_paired_device_ieee(). See SPECIFICATIONS.md "Protocole". */
 static void zdo_bind_basic_cluster(uint16_t dst_short_addr, const esp_zb_ieee_addr_t dst_ieee_addr, uint8_t dst_endpoint)
 {
     esp_zb_ieee_addr_t coordinator_ieee;
@@ -708,20 +694,17 @@ static void tuya_send_set_dp_temperature(uint16_t dst_addr, uint8_t dst_endpoint
     }
 }
 
-/* Write the heating setpoint to the device.
+/* Write the heating setpoint to the device, on DP4 (KETOTEK_DP_HEATING_SETPOINT).
  *
- * Writes BOTH DP103 (KETOTEK_DP_HEATING_SETPOINT, the Saswell-scheme DP
- * /thermostat's simulator listens for in handle_tuya_set_data()) AND DP4
- * (KETOTEK_DP_HEATING_SETPOINT_ECHO). CONFIRMED on real hardware
- * (2026-08-09): on the real KTF0177, sending DP103 alone gets acknowledged
- * (ZCL Default Response, status=SUCCESS) but the displayed setpoint never
- * actually changes - that SUCCESS is just the ZCL layer accepting a
- * well-formed frame, not proof the device understood DP103 specifically
- * (same as the Data Query 0x11, also SUCCESS-acked with zero functional
- * effect). DP4 is the DP that actually works: writing it changed the
- * setpoint shown on the head's own screen. DP103 is kept in this same call
- * only for the simulator's round-trip - on real hardware it's a no-op. See
- * SPECIFICATIONS.md "Protocole".
+ * CONFIRMED on real hardware (2026-08-09): writing DP4 changed the setpoint
+ * shown on the head's own screen. This used to also write a separate DP103
+ * (a Saswell-scheme guess that turned out not to apply to this device at
+ * all - see "Erreur historique" in SPECIFICATIONS.md "Protocole" for how
+ * the real DP table, from the exact zigbee-herdsman-converters match for
+ * this device's manufacturerName/modelIdentifier, was found). DP4 is both
+ * the real device's actual write DP AND what KETOTEK_DP_HEATING_SETPOINT
+ * now points to, so this single write also round-trips correctly against
+ * /thermostat's simulator (handle_tuya_set_data()).
  *
  * NOTE: not wired to any automatic trigger beyond what's already hooked up
  * in zb_action_handler() (first report per device, every DP2 report). A
@@ -730,7 +713,6 @@ static void tuya_send_set_dp_temperature(uint16_t dst_addr, uint8_t dst_endpoint
 static void tuya_send_set_temperature(uint16_t dst_addr, uint8_t dst_endpoint, int16_t temperature_deg)
 {
     tuya_send_set_dp_temperature(dst_addr, dst_endpoint, KETOTEK_DP_HEATING_SETPOINT, temperature_deg);
-    tuya_send_set_dp_temperature(dst_addr, dst_endpoint, KETOTEK_DP_HEATING_SETPOINT_ECHO, temperature_deg);
 }
 
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)

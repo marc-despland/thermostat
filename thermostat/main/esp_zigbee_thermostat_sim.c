@@ -178,16 +178,63 @@ static void tuya_send_dp_bool(uint16_t dst_addr, uint8_t dst_endpoint, uint8_t d
     }
 }
 
+static void tuya_send_dp_enum(uint16_t dst_addr, uint8_t dst_endpoint, uint8_t dp_id, uint8_t value)
+{
+    g_tuya_seq++;
+    if (g_tuya_seq >= 0xFFFF) {
+        g_tuya_seq = 0;
+    }
+    g_tuya_report_buf[0] = (g_tuya_seq >> 8) & 0xFF;
+    g_tuya_report_buf[1] = g_tuya_seq & 0xFF;
+    g_tuya_report_buf[2] = dp_id;
+    g_tuya_report_buf[3] = TUYA_DP_TYPE_ENUM;
+    g_tuya_report_buf[4] = 0x00;
+    g_tuya_report_buf[5] = 0x01;
+    g_tuya_report_buf[6] = value;
+
+    esp_zb_zcl_custom_cluster_cmd_req_t cmd_req = {
+        .zcl_basic_cmd = {
+            .dst_addr_u.addr_short = dst_addr,
+            .dst_endpoint = dst_endpoint,
+            .src_endpoint = THERMOSTAT_SIM_ENDPOINT,
+        },
+        .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .cluster_id = TUYA_CLUSTER_ID,
+        .custom_cmd_id = TUYA_CMD_REPORT_1,
+        .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
+        .data = {
+            /* NOT ARRAY - see the matching comment on tuya_send_dp_bool() above. */
+            .type = ESP_ZB_ZCL_ATTR_TYPE_SET,
+            .value = g_tuya_report_buf,
+            .size = 7,
+        },
+    };
+    ESP_LOG_BUFFER_HEX_LEVEL(TAG, g_tuya_report_buf, 7, ESP_LOG_INFO);
+    uint8_t tx_seq = esp_zb_zcl_custom_cluster_cmd_req(&cmd_req);
+    if (tx_seq == 0xFF) {
+        ESP_LOGE(TAG, "Failed to send DP%u report: stack rejected command", dp_id);
+    } else {
+        ESP_LOGI(TAG, "Sent DP%u report: value=%u (tx_seq=0x%02x)", dp_id, value, tx_seq);
+    }
+}
+
+/* Simulated child lock state (DP7) - no ZCL-standard attribute backs this,
+ * so it's just a local flag here; always OFF, nothing currently toggles it
+ * on the simulator side. Sent anyway so /gateway's DP7-triggered debug
+ * probes (Data Query) fire against this simulator too, same reasoning as
+ * DP5 below. */
+static bool g_child_lock = false;
+
 /* Report the handful of DPs relevant to "read the thermostat's data"
- * (SPECIFICATIONS.md) - system state, local temperature, current setpoint.
- * Real Tuya devices send one DP per message, so this issues several sends.
+ * (SPECIFICATIONS.md) - system mode, local temperature, current setpoint,
+ * child lock. Real Tuya devices send one DP per message, so this issues
+ * several sends.
  *
- * DP5 (KETOTEK_DP_LOCAL_TEMP_REAL) is added alongside the Saswell-scheme
- * DP101/102/103 kept for the already-validated "Cas simple": DP5 is the
- * local temperature DP actually confirmed on the real KTF0177 (see
- * SPECIFICATIONS.md "Protocole"), and /gateway's DP5-triggered debug probes
- * (Data Query, ZCL Read Attributes) need it to fire against this simulator
- * too. */
+ * DP IDs match the confirmed real table (AVATTO ME167_1 / TS0601_thermostat_5,
+ * see tuya_ketotek_dp.h) rather than the earlier Saswell-based guess: DP2
+ * (system_mode), DP4 (heating setpoint), DP5 (local temperature), DP7
+ * (child lock). */
 static void tuya_send_dp_report(uint16_t dst_addr, uint8_t dst_endpoint)
 {
     if (!g_scenario_first_report_done) {
@@ -195,10 +242,14 @@ static void tuya_send_dp_report(uint16_t dst_addr, uint8_t dst_endpoint)
                      g_local_temperature / 100.0, g_occupied_heating_setpoint / 100.0);
         g_scenario_first_report_done = true;
     }
-    tuya_send_dp_bool(dst_addr, dst_endpoint, KETOTEK_DP_SYSTEM_STATE, g_system_mode != 0);
+    /* g_system_mode is a standard ZCL Thermostat system_mode value
+     * (0x00=Off, 0x04=Heat by default - see DEFAULT_SYSTEM_MODE); map it to
+     * the Tuya DP2 enum (auto=0, heat=1, off=2). No "auto" concept in the
+     * simulated ZCL state, so it's just heat/off here. */
+    tuya_send_dp_enum(dst_addr, dst_endpoint, KETOTEK_DP_SYSTEM_MODE, g_system_mode != 0 ? 1 : 2);
+    tuya_send_dp_bool(dst_addr, dst_endpoint, KETOTEK_DP_CHILD_LOCK, g_child_lock);
     tuya_send_dp_value(dst_addr, dst_endpoint, KETOTEK_DP_LOCAL_TEMP, tuya_dp_from_zcl_temp(g_local_temperature));
     tuya_send_dp_value(dst_addr, dst_endpoint, KETOTEK_DP_HEATING_SETPOINT, tuya_dp_from_zcl_temp(g_occupied_heating_setpoint));
-    tuya_send_dp_value(dst_addr, dst_endpoint, KETOTEK_DP_LOCAL_TEMP_REAL, tuya_dp_from_zcl_temp(g_local_temperature));
 }
 
 /* esp_timer callbacks run outside the Zigbee stack's own task - hop onto the
@@ -312,7 +363,8 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
 
 /* Decode a Tuya "Set DataPoint" command (cmd 0x00) from /gateway and apply it
  * to the simulated local state - this is the "reprogramming" path
- * (SPECIFICATIONS.md), mirroring /gateway's DP103 table. */
+ * (SPECIFICATIONS.md), mirroring /gateway's DP table (AVATTO ME167_1 /
+ * TS0601_thermostat_5, tuya_ketotek_dp.h). */
 static void handle_tuya_set_data(const uint8_t *data, uint16_t len)
 {
     if (len < TUYA_DP_HEADER_LEN) {
@@ -334,18 +386,20 @@ static void handle_tuya_set_data(const uint8_t *data, uint16_t len)
             g_occupied_heating_setpoint = tuya_dp_to_zcl_temp(tuya_setpoint);
             SCENARIO_LOG("Etape 5/5: CONSIGNE RECUE ET APPLIQUEE (%.1f C)", tuya_setpoint / 10.0);
             ESP_LOGI(TAG, "DP%u: heating setpoint updated to %.1f C", dp_id, tuya_setpoint / 10.0);
-            /* Echo the newly-applied setpoint back via DP4
-             * (KETOTEK_DP_HEATING_SETPOINT_ECHO), near-immediately - mirrors
-             * the confirmation report observed on the real KTF0177 right
-             * after it accepts a new setpoint (see SPECIFICATIONS.md
-             * "Protocole"). */
-            tuya_send_dp_value(GATEWAY_SHORT_ADDR, GATEWAY_TUYA_ENDPOINT, KETOTEK_DP_HEATING_SETPOINT_ECHO, tuya_setpoint);
+            /* Re-report the newly-applied setpoint on the same DP4,
+             * near-immediately - mirrors the confirmation report observed
+             * on the real KTF0177 right after it accepts a new setpoint
+             * (see SPECIFICATIONS.md "Protocole"). DP4 is both the write
+             * and report DP on the real device - no separate "echo" DP. */
+            tuya_send_dp_value(GATEWAY_SHORT_ADDR, GATEWAY_TUYA_ENDPOINT, KETOTEK_DP_HEATING_SETPOINT, tuya_setpoint);
         }
         break;
-    case KETOTEK_DP_SYSTEM_STATE:
+    case KETOTEK_DP_SYSTEM_MODE:
+        /* enum: auto=0, heat=1, off=2 (see tuya_ketotek_dp.h). Simulated
+         * ZCL state only distinguishes heat/off, no "auto" concept. */
         if (dp_len >= 1) {
-            g_system_mode = dp_data[0] ? DEFAULT_SYSTEM_MODE : 0x00;
-            ESP_LOGI(TAG, "DP%u: system state updated to %s", dp_id, dp_data[0] ? "ON" : "OFF");
+            g_system_mode = (dp_data[0] == 1) ? DEFAULT_SYSTEM_MODE : 0x00;
+            ESP_LOGI(TAG, "DP%u: system mode updated to %u (%s)", dp_id, dp_data[0], g_system_mode != 0 ? "Heat" : "Off/Auto");
         }
         break;
     default:
