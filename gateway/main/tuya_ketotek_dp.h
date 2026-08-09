@@ -34,7 +34,24 @@ typedef enum {
 
 /* KETOTEK KTF0177 DataPoints (DP103 scheme, per zigbee-herdsman-converters
  * Saswell/KETOTEK - see old/ZIGBEE2MQTT_ANALYSIS.md) */
+#define KETOTEK_DP_CONTROL_MODE          2   /* enum, 1 byte - not in the Saswell table,
+                                               * identified on real hardware: middle
+                                               * button mode toggle, 0=Automatique,
+                                               * 1=Manuel (see SPECIFICATIONS.md
+                                               * "Protocole") */
 #define KETOTEK_DP_HEATING_STATE        3   /* enum */
+#define KETOTEK_DP_HEATING_SETPOINT_ECHO 4   /* value, x10 C - not in the Saswell
+                                               * table, identified on real hardware:
+                                               * mirrors the setpoint currently applied
+                                               * on the head, including manual changes
+                                               * made on the device itself (see
+                                               * SPECIFICATIONS.md "Protocole") */
+#define KETOTEK_DP_CHILD_LOCK_REAL      7   /* bool - not in the Saswell table
+                                              * (which uses DP40, never observed on
+                                              * this device); confirmed on real
+                                              * hardware by toggling the child lock
+                                              * and observing this DP flip ON/OFF.
+                                              * See SPECIFICATIONS.md "Protocole". */
 #define KETOTEK_DP_WINDOW_DETECTION     8   /* bool */
 #define KETOTEK_DP_FROST_DETECTION      10  /* bool */
 #define KETOTEK_DP_TEMP_CALIBRATION     27  /* value, signed, -6..+6 C */

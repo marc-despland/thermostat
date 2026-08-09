@@ -73,7 +73,7 @@ static uint64_t g_last_report_time = 0;
  * arrive and be logged but the demo setpoint would never fire. Use the
  * report's own source address instead. */
 static bool g_demo_setpoint_sent = false;
-#define DEMO_HEATING_SETPOINT_DEG 21
+#define DEMO_HEATING_SETPOINT_DEG 14
 
 static void tuya_send_set_temperature(uint16_t dst_addr, uint8_t dst_endpoint, int16_t temperature_deg);
 
@@ -118,8 +118,29 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
 static void tuya_log_dp(uint8_t dp_id, uint8_t dp_type, uint16_t dp_len, const uint8_t *dp_data)
 {
     switch (dp_id) {
+    case KETOTEK_DP_CONTROL_MODE:
+        /* Not in the documented Saswell/KETOTEK table - identified on real
+         * hardware: toggled by the head's middle button, confirmed
+         * 0=Automatique / 1=Manuel. See SPECIFICATIONS.md "Protocole". */
+        ESP_LOGI(TAG, "  DP%u (ControlMode/enum): %s", dp_id, (dp_len >= 1 && dp_data[0]) ? "Manuel" : "Automatique");
+        break;
+    case KETOTEK_DP_CHILD_LOCK_REAL:
+        /* Not in the documented Saswell/KETOTEK table (which uses DP40,
+         * never observed on this device) - confirmed on real hardware by
+         * toggling the child lock. See SPECIFICATIONS.md "Protocole". */
+        ESP_LOGI(TAG, "  DP%u (ChildLock/bool): %s", dp_id, (dp_len >= 1 && dp_data[0]) ? "ON" : "OFF");
+        break;
     case KETOTEK_DP_HEATING_STATE:
         ESP_LOGI(TAG, "  DP%u (HeatingState/enum): %u", dp_id, dp_len >= 1 ? dp_data[0] : 0);
+        break;
+    case KETOTEK_DP_HEATING_SETPOINT_ECHO:
+        /* Not in the documented Saswell/KETOTEK table - identified on real
+         * hardware: tracks the setpoint currently applied on the head,
+         * confirmed by echoing a setpoint changed manually on the device
+         * itself. See SPECIFICATIONS.md "Protocole". */
+        if (dp_len == 4) {
+            ESP_LOGI(TAG, "  DP%u (HeatingSetpointEcho/value): %.1f C", dp_id, tuya_dp_decode_value(dp_data) / 10.0);
+        }
         break;
     case KETOTEK_DP_WINDOW_DETECTION:
         ESP_LOGI(TAG, "  DP%u (WindowDetection/bool): %s", dp_id, (dp_len >= 1 && dp_data[0]) ? "ON" : "OFF");
