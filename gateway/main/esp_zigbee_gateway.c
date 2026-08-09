@@ -130,6 +130,15 @@ static void tuya_log_dp(uint8_t dp_id, uint8_t dp_type, uint16_t dp_len, const u
          * toggling the child lock. See SPECIFICATIONS.md "Protocole". */
         ESP_LOGI(TAG, "  DP%u (ChildLock/bool): %s", dp_id, (dp_len >= 1 && dp_data[0]) ? "ON" : "OFF");
         break;
+    case KETOTEK_DP_LOCAL_TEMP_REAL:
+        /* Not in the documented Saswell/KETOTEK table (which uses DP102,
+         * never observed on this device) - confirmed on real hardware,
+         * matches the temperature shown on the head's screen. See
+         * SPECIFICATIONS.md "Protocole". */
+        if (dp_len == 4) {
+            ESP_LOGI(TAG, "  DP%u (LocalTemp/value): %.1f C", dp_id, tuya_dp_decode_value(dp_data) / 10.0);
+        }
+        break;
     case KETOTEK_DP_HEATING_STATE:
         ESP_LOGI(TAG, "  DP%u (HeatingState/enum): %u", dp_id, dp_len >= 1 ? dp_data[0] : 0);
         break;

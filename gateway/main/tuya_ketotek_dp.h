@@ -46,6 +46,13 @@ typedef enum {
                                                * on the head, including manual changes
                                                * made on the device itself (see
                                                * SPECIFICATIONS.md "Protocole") */
+#define KETOTEK_DP_LOCAL_TEMP_REAL      5   /* value, x10 C - not in the Saswell
+                                              * table (which uses DP102, never
+                                              * observed on this device); confirmed
+                                              * on real hardware, matches the
+                                              * temperature shown on the head's
+                                              * screen. See SPECIFICATIONS.md
+                                              * "Protocole". */
 #define KETOTEK_DP_CHILD_LOCK_REAL      7   /* bool - not in the Saswell table
                                               * (which uses DP40, never observed on
                                               * this device); confirmed on real
