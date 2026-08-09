@@ -61,21 +61,56 @@ static bool g_send_in_progress = false;
 /* Track report interval from the paired device, for diagnostics only. */
 static uint64_t g_last_report_time = 0;
 
-/* "Cas simple" test scenario (SPECIFICATIONS.md): send a demo setpoint once,
- * right after the FIRST Tuya status report received since THIS gateway boot -
- * not on a free-running timer (see the removed old/ hack). Deliberately NOT
- * gated on ESP_ZB_ZDO_SIGNAL_DEVICE_ANNCE: that signal only fires on a true
- * (re)association, but a device that's already joined and just reboots
- * (esp_zb_bdb_is_factory_new() == false, e.g. the real KETOTEK, or our own
- * thermostat sim across repeated test reflashes) resumes silently without
- * re-announcing - relying on DEVICE_ANNCE left g_awaiting_setpoint_addr at 0
- * forever after the gateway's own reboot, in which case a report could
- * arrive and be logged but the demo setpoint would never fire. Use the
- * report's own source address instead. */
-static bool g_demo_setpoint_sent = false;
+/* "Cas simple" test scenario (SPECIFICATIONS.md): send a demo setpoint once
+ * per device, right after THAT device's FIRST Tuya status report received
+ * since THIS gateway boot - not on a free-running timer (see the removed
+ * old/ hack). Deliberately NOT gated on ESP_ZB_ZDO_SIGNAL_DEVICE_ANNCE: that
+ * signal only fires on a true (re)association, but a device that's already
+ * joined and just reboots (esp_zb_bdb_is_factory_new() == false, e.g. the
+ * real KETOTEK, or our own thermostat sim across repeated test reflashes)
+ * resumes silently without re-announcing - relying on DEVICE_ANNCE left
+ * g_awaiting_setpoint_addr at 0 forever after the gateway's own reboot, in
+ * which case a report could arrive and be logged but the demo setpoint
+ * would never fire. Use the report's own source address instead.
+ *
+ * Tracked per short_addr (not a single global bool): with the real KETOTEK
+ * and /thermostat sim paired at the same time, a single flag meant whichever
+ * device's report arrived first after gateway boot "won" the demo setpoint
+ * and the other never got it - observed in testing (the sim's steady 30s
+ * cadence reliably beat the real head's slower/irregular one). Decoupled
+ * from g_paired_devices[] for the same DEVICE_ANNCE reason as above. */
+#define MAX_DEMO_SETPOINT_TRACKED 10
+static uint16_t g_demo_setpoint_sent_addrs[MAX_DEMO_SETPOINT_TRACKED];
+static uint8_t g_demo_setpoint_sent_count = 0;
 #define DEMO_HEATING_SETPOINT_DEG 14
 
+static bool demo_setpoint_already_sent(uint16_t short_addr)
+{
+    for (uint8_t i = 0; i < g_demo_setpoint_sent_count; i++) {
+        if (g_demo_setpoint_sent_addrs[i] == short_addr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void demo_setpoint_mark_sent(uint16_t short_addr)
+{
+    if (g_demo_setpoint_sent_count < MAX_DEMO_SETPOINT_TRACKED) {
+        g_demo_setpoint_sent_addrs[g_demo_setpoint_sent_count++] = short_addr;
+    } else {
+        ESP_LOGW(TAG, "Demo setpoint tracking full (%d) - device 0x%04x may re-receive it", MAX_DEMO_SETPOINT_TRACKED, short_addr);
+    }
+}
+
+/* Debug probe: fire a TUYA Data Query (cmd 0x11, see old/TUYA_ZIGBEE_PROTOCOL.md
+ * "Commande 0x11") on every DP5 (KETOTEK_DP_LOCAL_TEMP_REAL) report, to check
+ * whether the real KTF0177 ever replies with more than one DP. Deliberately
+ * repeatable, not one-shot - see the call site in zb_action_handler(). */
+
 static void tuya_send_set_temperature(uint16_t dst_addr, uint8_t dst_endpoint, int16_t temperature_deg);
+static void tuya_send_data_query(uint16_t dst_addr, uint8_t dst_endpoint);
+static void zcl_send_read_thermostat_attrs(uint16_t dst_addr, uint8_t dst_endpoint);
 
 /* Standard ZCL Thermostat cluster (0x0201) attribute update callback. */
 static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t *message)
@@ -215,6 +250,62 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
     case ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID:
         ret = zb_attribute_handler((esp_zb_zcl_set_attr_value_message_t *)message);
         break;
+    case ESP_ZB_CORE_CMD_DEFAULT_RESP_CB_ID: {
+        /* Standard ZCL Default Response - the device declining to answer a
+         * command with actual data (e.g. our TUYA_CMD_QUERY probe) shows up
+         * here instead of a custom cluster report. Decode the status code to
+         * tell a real rejection (UNSUP_CLUST_CMD etc.) from a bare ack. */
+        esp_zb_zcl_cmd_default_resp_message_t *resp = (esp_zb_zcl_cmd_default_resp_message_t *)message;
+        const char *status_name;
+        switch (resp->status_code) {
+        case ESP_ZB_ZCL_STATUS_SUCCESS:            status_name = "SUCCESS"; break;
+        case ESP_ZB_ZCL_STATUS_FAIL:               status_name = "FAIL"; break;
+        case ESP_ZB_ZCL_STATUS_MALFORMED_CMD:      status_name = "MALFORMED_CMD"; break;
+        case ESP_ZB_ZCL_STATUS_UNSUP_CLUST_CMD:    status_name = "UNSUP_CLUST_CMD"; break;
+        case ESP_ZB_ZCL_STATUS_UNSUP_GEN_CMD:      status_name = "UNSUP_GEN_CMD"; break;
+        case ESP_ZB_ZCL_STATUS_UNSUP_MANUF_CLUST_CMD: status_name = "UNSUP_MANUF_CLUST_CMD"; break;
+        case ESP_ZB_ZCL_STATUS_UNSUP_MANUF_GEN_CMD: status_name = "UNSUP_MANUF_GEN_CMD"; break;
+        case ESP_ZB_ZCL_STATUS_INVALID_FIELD:      status_name = "INVALID_FIELD"; break;
+        default:                                   status_name = "OTHER"; break;
+        }
+        /* cluster is included because resp_to_cmd alone is ambiguous: e.g.
+         * TUYA_CMD_SET_DATA (cluster 0xEF00) and the generic ZCL Read
+         * Attributes command (cluster 0x0201) are both id 0x00. */
+        ESP_LOGW(TAG, "ZCL Default Response from 0x%04x: cluster=0x%04x resp_to_cmd=0x%02x status=0x%02x (%s)",
+                 resp->info.src_address.u.short_addr, resp->info.cluster, resp->resp_to_cmd, resp->status_code, status_name);
+        ret = ESP_OK;
+        break;
+    }
+    case ESP_ZB_CORE_CMD_READ_ATTR_RESP_CB_ID: {
+        /* Response to zcl_send_read_thermostat_attrs() - standard ZCL Read
+         * Attributes on cluster 0x0201, tried as an alternative to the Tuya
+         * Data Query (0x11), which is accepted (SUCCESS) but produces no DP
+         * dump. See SPECIFICATIONS.md "Protocole". */
+        esp_zb_zcl_cmd_read_attr_resp_message_t *resp = (esp_zb_zcl_cmd_read_attr_resp_message_t *)message;
+        for (esp_zb_zcl_read_attr_resp_variable_t *var = resp->variables; var; var = var->next) {
+            if (var->status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+                ESP_LOGW(TAG, "ZCL Read Attr Response from 0x%04x: attr=0x%04x status=0x%02x (FAIL)",
+                         resp->info.src_address.u.short_addr, var->attribute.id, var->status);
+                continue;
+            }
+            int32_t val = 0;
+            switch (var->attribute.data.type) {
+            case ESP_ZB_ZCL_ATTR_TYPE_S16:
+                val = *(int16_t *)var->attribute.data.value;
+                break;
+            case ESP_ZB_ZCL_ATTR_TYPE_U8:
+            case ESP_ZB_ZCL_ATTR_TYPE_8BIT_ENUM:
+                val = *(uint8_t *)var->attribute.data.value;
+                break;
+            default:
+                break;
+            }
+            ESP_LOGI(TAG, "ZCL Read Attr Response from 0x%04x: attr=0x%04x type=0x%02x value=%d",
+                     resp->info.src_address.u.short_addr, var->attribute.id, var->attribute.data.type, (int)val);
+        }
+        ret = ESP_OK;
+        break;
+    }
     case ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_REQ_CB_ID:
     case ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_RESP_CB_ID: {
         /* Handle TUYA custom cluster 0xef00 commands from KETOTEK. Both
@@ -260,18 +351,49 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
                     ESP_LOGW(TAG, "Truncated DP payload: dp_id=%u announced_len=%u total_len=%u", dp_id, dp_len, len);
                 }
 
+                uint16_t src_addr = custom_cmd->info.src_address.u.short_addr;
+                uint8_t src_ep = custom_cmd->info.src_endpoint;
+
                 /* "Cas simple" scenario, step "La gateway envoi la temperature
                  * de consigne au thermostat": react to the first status
-                 * report seen since boot by sending the demo setpoint back
-                 * to whoever sent it (one-shot per gateway boot, see
-                 * g_demo_setpoint_sent above - not gated on DEVICE_ANNCE). */
-                if (!g_demo_setpoint_sent) {
-                    uint16_t src_addr = custom_cmd->info.src_address.u.short_addr;
-                    uint8_t src_ep = custom_cmd->info.src_endpoint;
+                 * report seen since boot from THIS device by sending it the
+                 * demo setpoint (one-shot per device per gateway boot, see
+                 * demo_setpoint_already_sent() above - not gated on
+                 * DEVICE_ANNCE). */
+                if (!demo_setpoint_already_sent(src_addr)) {
                     SCENARIO_LOG("Etape 4/5: STATUT RECU du thermostat (device=0x%04x)", src_addr);
                     SCENARIO_LOG("Etape 5/5: ENVOI DE LA CONSIGNE au thermostat (%d C) - voir 'TUYA command sent' ci-dessous pour le resultat", DEMO_HEATING_SETPOINT_DEG);
                     tuya_send_set_temperature(src_addr, src_ep, DEMO_HEATING_SETPOINT_DEG);
-                    g_demo_setpoint_sent = true;
+                    demo_setpoint_mark_sent(src_addr);
+                }
+
+                /* On every DP2 (control mode) report, (re)send the heating
+                 * setpoint. Not gated on the mode's value (Manuel/Auto) nor
+                 * one-shot - fires on every DP2 report, same repeatable
+                 * pattern as the DP5 probe below. */
+                if (dp_id == KETOTEK_DP_CONTROL_MODE) {
+                    ESP_LOGI(TAG, "DP2 seen - sending TUYA Setpoint (%d C) to device 0x%04x", DEMO_HEATING_SETPOINT_DEG, src_addr);
+                    tuya_send_set_temperature(src_addr, src_ep, DEMO_HEATING_SETPOINT_DEG);
+                }
+
+                /* Debug probe: on every DP5 (local temp) report, ask the
+                 * device for a full DP dump via Data Query (cmd 0x11), to
+                 * check whether it ever replies with more than one DP. Not
+                 * one-shot (deliberately repeatable across DP5 reports, one
+                 * every ~30-120s per observed report intervals - low enough
+                 * rate to be a non-issue for the device or network). */
+                if (dp_id == KETOTEK_DP_LOCAL_TEMP_REAL) {
+                    ESP_LOGI(TAG, "DP5 seen - sending TUYA Data Query to device 0x%04x", src_addr);
+                    tuya_send_data_query(src_addr, src_ep);
+
+                    /* Alternative probe tried alongside the Tuya Data Query:
+                     * a standard ZCL Read Attributes on cluster 0x0201
+                     * (Thermostat), in case the head actually backs that
+                     * cluster with live data instead of just declaring it
+                     * for HA-profile compatibility. See SPECIFICATIONS.md
+                     * "Protocole". */
+                    ESP_LOGI(TAG, "DP5 seen - sending ZCL Read Attributes (cluster 0x0201) to device 0x%04x", src_addr);
+                    zcl_send_read_thermostat_attrs(src_addr, src_ep);
                 }
             } else if (cmd_id == TUYA_CMD_TIME_SYNC) {
                 ESP_LOGI(TAG, "  -> TUYA Time Sync Request (TODO: unhandled, no response sent)");
@@ -345,16 +467,48 @@ static void tuya_send_data_query(uint16_t dst_addr, uint8_t dst_endpoint)
     }
 }
 
-/* Send TUYA "Set DataPoint" command to write the heating setpoint (DP103).
- *
- * NOTE: this is the send-side plumbing only - it is not wired to any
- * automatic trigger in this pass (the old code's "resend 10C every 20s"
- * timer hack has been intentionally removed). Call this manually (e.g. from
- * a debugger, or temporarily from ESP_ZB_ZDO_SIGNAL_DEVICE_ANNCE below) to
- * smoke-test the DP103 remap against /thermostat. A real "set setpoint to X"
- * entry point (console CLI or similar) is a follow-up, see
- * CONFIG_THERMOSTAT_ENABLE_CLI. */
-static void tuya_send_set_temperature(uint16_t dst_addr, uint8_t dst_endpoint, int16_t temperature_deg)
+/* Send a standard ZCL Read Attributes request on the Thermostat cluster
+ * (0x0201) - alternative probe to the Tuya Data Query (0x11) above, in case
+ * the head actually backs this standard HA cluster with live data rather
+ * than just declaring it for profile compatibility. See SPECIFICATIONS.md
+ * "Protocole". */
+static void zcl_send_read_thermostat_attrs(uint16_t dst_addr, uint8_t dst_endpoint)
+{
+    static uint16_t attr_field[] = {
+        ESP_ZB_ZCL_ATTR_THERMOSTAT_LOCAL_TEMPERATURE_ID,
+        ESP_ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_ID,
+        ESP_ZB_ZCL_ATTR_THERMOSTAT_SYSTEM_MODE_ID,
+    };
+
+    if (!esp_zb_bdb_dev_joined()) {
+        ESP_LOGE(TAG, "Cannot send command: gateway not joined to network");
+        return;
+    }
+
+    esp_zb_zcl_read_attr_cmd_t read_req = {
+        .zcl_basic_cmd = {
+            .dst_addr_u.addr_short = dst_addr,
+            .dst_endpoint = dst_endpoint,
+            .src_endpoint = ESP_ZB_GATEWAY_ENDPOINT,
+        },
+        .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .clusterID = ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT,
+        .attr_number = sizeof(attr_field) / sizeof(attr_field[0]),
+        .attr_field = attr_field,
+    };
+
+    uint8_t tx_seq = esp_zb_zcl_read_attr_cmd_req(&read_req);
+    if (tx_seq == 0xFF) {
+        ESP_LOGE(TAG, "Failed to send Read Attributes: stack rejected command");
+    } else {
+        ESP_LOGI(TAG, "Read Attributes sent successfully (tx_seq=0x%02x)", tx_seq);
+    }
+}
+
+/* Send a single TUYA "Set DataPoint" (cmd 0x00) frame writing a x10-encoded
+ * temperature value to the given DP. Factored out of tuya_send_set_temperature()
+ * below so the same setpoint can be written to more than one DP_ID per call. */
+static void tuya_send_set_dp_temperature(uint16_t dst_addr, uint8_t dst_endpoint, uint8_t dp_id, int16_t temperature_deg)
 {
     uint16_t cmd_seq;
     if (g_last_device_seq > 0) {
@@ -369,14 +523,14 @@ static void tuya_send_set_temperature(uint16_t dst_addr, uint8_t dst_endpoint, i
 
     g_tuya_cmd_buffer[0] = (cmd_seq >> 8) & 0xFF;
     g_tuya_cmd_buffer[1] = cmd_seq & 0xFF;
-    g_tuya_cmd_buffer[2] = KETOTEK_DP_HEATING_SETPOINT; /* DP103 */
+    g_tuya_cmd_buffer[2] = dp_id;
     g_tuya_cmd_buffer[3] = TUYA_DP_TYPE_VALUE;
     g_tuya_cmd_buffer[4] = 0x00;
     g_tuya_cmd_buffer[5] = 0x04; /* 4-byte value */
     tuya_dp_encode_value(&g_tuya_cmd_buffer[6], (int32_t)temperature_deg * 10);
 
     ESP_LOGI(TAG, "Sending TUYA Setpoint: %d C (DP%u) to device 0x%04x, seq=0x%04x",
-             temperature_deg, KETOTEK_DP_HEATING_SETPOINT, dst_addr, cmd_seq);
+             temperature_deg, dp_id, dst_addr, cmd_seq);
     ESP_LOG_BUFFER_HEX_LEVEL(TAG, g_tuya_cmd_buffer, 10, ESP_LOG_INFO);
 
     if (!esp_zb_bdb_dev_joined()) {
@@ -423,6 +577,31 @@ static void tuya_send_set_temperature(uint16_t dst_addr, uint8_t dst_endpoint, i
         ESP_LOGI(TAG, "TUYA command sent successfully (tx_seq=0x%02x)", tx_seq);
         g_last_device_seq = cmd_seq;
     }
+}
+
+/* Write the heating setpoint to the device.
+ *
+ * Writes BOTH DP103 (KETOTEK_DP_HEATING_SETPOINT, the Saswell-scheme DP
+ * /thermostat's simulator listens for in handle_tuya_set_data()) AND DP4
+ * (KETOTEK_DP_HEATING_SETPOINT_ECHO). CONFIRMED on real hardware
+ * (2026-08-09): on the real KTF0177, sending DP103 alone gets acknowledged
+ * (ZCL Default Response, status=SUCCESS) but the displayed setpoint never
+ * actually changes - that SUCCESS is just the ZCL layer accepting a
+ * well-formed frame, not proof the device understood DP103 specifically
+ * (same as the Data Query 0x11, also SUCCESS-acked with zero functional
+ * effect). DP4 is the DP that actually works: writing it changed the
+ * setpoint shown on the head's own screen. DP103 is kept in this same call
+ * only for the simulator's round-trip - on real hardware it's a no-op. See
+ * SPECIFICATIONS.md "Protocole".
+ *
+ * NOTE: not wired to any automatic trigger beyond what's already hooked up
+ * in zb_action_handler() (first report per device, every DP2 report). A
+ * real "set setpoint to X" entry point (console CLI or similar) is a
+ * follow-up, see CONFIG_THERMOSTAT_ENABLE_CLI. */
+static void tuya_send_set_temperature(uint16_t dst_addr, uint8_t dst_endpoint, int16_t temperature_deg)
+{
+    tuya_send_set_dp_temperature(dst_addr, dst_endpoint, KETOTEK_DP_HEATING_SETPOINT, temperature_deg);
+    tuya_send_set_dp_temperature(dst_addr, dst_endpoint, KETOTEK_DP_HEATING_SETPOINT_ECHO, temperature_deg);
 }
 
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
@@ -485,7 +664,24 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         dev_annce_params = (esp_zb_zdo_signal_device_annce_params_t *)esp_zb_app_signal_get_params(p_sg_p);
         ESP_LOGI(TAG, "Device FOUND! New device commissioned or rejoined (short: 0x%04hx)", dev_annce_params->device_short_addr);
 
-        if (g_paired_devices_count < MAX_PAIRED_DEVICES) {
+        /* De-dupe: DEVICE_ANNCE can fire again for an already-known device
+         * (e.g. it re-announces itself without a real re-pairing) - without
+         * this check it kept getting appended as a brand new entry with the
+         * same short_addr, inflating g_paired_devices_count and wasting
+         * slots (observed: "Device 1" and "Device 2" both 0xf42f). */
+        bool already_known = false;
+        for (int i = 0; i < g_paired_devices_count; i++) {
+            if (g_paired_devices[i].short_addr == dev_annce_params->device_short_addr) {
+                already_known = true;
+                ESP_LOGI(TAG, "Device 0x%04hx already registered (slot %d) - not re-adding", dev_annce_params->device_short_addr, i + 1);
+                break;
+            }
+        }
+
+        if (already_known) {
+            /* Nothing to register, but still fine to let this trigger the
+             * demo setpoint below via the existing device. */
+        } else if (g_paired_devices_count < MAX_PAIRED_DEVICES) {
             g_paired_devices[g_paired_devices_count].short_addr = dev_annce_params->device_short_addr;
             g_paired_devices[g_paired_devices_count].endpoint = 1;
             snprintf(g_paired_devices[g_paired_devices_count].model, sizeof(g_paired_devices[g_paired_devices_count].model), "Device_%d", g_paired_devices_count + 1);
@@ -501,8 +697,8 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 
             /* "Cas simple" scenario: don't send the setpoint yet - wait for
              * the first status report seen since boot (see the
-             * TUYA_CMD_REPORT handling above, g_demo_setpoint_sent) so
-             * whoever sent it is confirmed awake and ready to receive
+             * TUYA_CMD_REPORT handling above, demo_setpoint_already_sent())
+             * so whoever sent it is confirmed awake and ready to receive
              * commands. This fires on true (re)association; a device that's
              * already joined and merely reboots won't hit this case at all,
              * but will still trigger the demo setpoint via its first report.

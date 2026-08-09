@@ -180,7 +180,14 @@ static void tuya_send_dp_bool(uint16_t dst_addr, uint8_t dst_endpoint, uint8_t d
 
 /* Report the handful of DPs relevant to "read the thermostat's data"
  * (SPECIFICATIONS.md) - system state, local temperature, current setpoint.
- * Real Tuya devices send one DP per message, so this issues several sends. */
+ * Real Tuya devices send one DP per message, so this issues several sends.
+ *
+ * DP5 (KETOTEK_DP_LOCAL_TEMP_REAL) is added alongside the Saswell-scheme
+ * DP101/102/103 kept for the already-validated "Cas simple": DP5 is the
+ * local temperature DP actually confirmed on the real KTF0177 (see
+ * SPECIFICATIONS.md "Protocole"), and /gateway's DP5-triggered debug probes
+ * (Data Query, ZCL Read Attributes) need it to fire against this simulator
+ * too. */
 static void tuya_send_dp_report(uint16_t dst_addr, uint8_t dst_endpoint)
 {
     if (!g_scenario_first_report_done) {
@@ -191,6 +198,7 @@ static void tuya_send_dp_report(uint16_t dst_addr, uint8_t dst_endpoint)
     tuya_send_dp_bool(dst_addr, dst_endpoint, KETOTEK_DP_SYSTEM_STATE, g_system_mode != 0);
     tuya_send_dp_value(dst_addr, dst_endpoint, KETOTEK_DP_LOCAL_TEMP, tuya_dp_from_zcl_temp(g_local_temperature));
     tuya_send_dp_value(dst_addr, dst_endpoint, KETOTEK_DP_HEATING_SETPOINT, tuya_dp_from_zcl_temp(g_occupied_heating_setpoint));
+    tuya_send_dp_value(dst_addr, dst_endpoint, KETOTEK_DP_LOCAL_TEMP_REAL, tuya_dp_from_zcl_temp(g_local_temperature));
 }
 
 /* esp_timer callbacks run outside the Zigbee stack's own task - hop onto the
@@ -326,6 +334,12 @@ static void handle_tuya_set_data(const uint8_t *data, uint16_t len)
             g_occupied_heating_setpoint = tuya_dp_to_zcl_temp(tuya_setpoint);
             SCENARIO_LOG("Etape 5/5: CONSIGNE RECUE ET APPLIQUEE (%.1f C)", tuya_setpoint / 10.0);
             ESP_LOGI(TAG, "DP%u: heating setpoint updated to %.1f C", dp_id, tuya_setpoint / 10.0);
+            /* Echo the newly-applied setpoint back via DP4
+             * (KETOTEK_DP_HEATING_SETPOINT_ECHO), near-immediately - mirrors
+             * the confirmation report observed on the real KTF0177 right
+             * after it accepts a new setpoint (see SPECIFICATIONS.md
+             * "Protocole"). */
+            tuya_send_dp_value(GATEWAY_SHORT_ADDR, GATEWAY_TUYA_ENDPOINT, KETOTEK_DP_HEATING_SETPOINT_ECHO, tuya_setpoint);
         }
         break;
     case KETOTEK_DP_SYSTEM_STATE:
@@ -359,8 +373,15 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
         if (cmd_id == TUYA_CMD_SET_DATA && data && len > 0) {
             handle_tuya_set_data(data, len);
         } else if (cmd_id == TUYA_CMD_QUERY) {
-            ESP_LOGI(TAG, "Data Query received - sending DP report");
-            tuya_send_dp_report(GATEWAY_SHORT_ADDR, GATEWAY_TUYA_ENDPOINT);
+            /* Confirmed on the real KTF0177 (SPECIFICATIONS.md "Protocole",
+             * section "Data Query (0x11)"): the head accepts this command
+             * (ZCL Default Response, status=SUCCESS, sent automatically by
+             * the stack since dis_default_resp isn't set) but does NOT
+             * follow up with a DP dump - it keeps reporting on its own
+             * spontaneous schedule. Previously this simulator answered with
+             * a full tuya_send_dp_report() burst, which turned out to be
+             * more helpful than accurate - removed to match real hardware. */
+            ESP_LOGI(TAG, "Data Query received - ack only (no DP dump), matches real KTF0177 behavior");
         }
         break;
     }

@@ -39,7 +39,8 @@ Détail des éléments du protocole Zigbee utilisés à chaque étape (implémen
 
 * **La gateway envoie la température de consigne au thermostat**
   - Protocole : cluster Tuya `0xEF00`, commande `TUYA_CMD_SET_DATA (0x00)`, DataPoint DP103 (`KETOTEK_DP_HEATING_SETPOINT`), type `TUYA_DP_TYPE_VALUE`, valeur encodée ×10 big-endian
-  - Implémenté : `tuya_send_set_temperature()` (gateway), déclenchée automatiquement (`g_demo_setpoint_sent`) dès réception du **premier** rapport de statut Tuya reçu depuis le démarrage de la gateway — pas immédiatement au `DEVICE_ANNCE` (le device n'est pas forcément prêt à recevoir une commande à cet instant, et un device déjà appairé qui redémarre simplement ne renvoie pas toujours ce signal), et en une seule fois (pas de boucle périodique, contrairement au hack retiré d'`old/`). Valeur de démo : `DEMO_HEATING_SETPOINT_DEG` (14°C)
+  - Implémenté : `tuya_send_set_temperature()` (gateway), déclenchée automatiquement (`demo_setpoint_already_sent()`/`demo_setpoint_mark_sent()`) dès réception du **premier** rapport de statut Tuya reçu depuis le démarrage de la gateway, **par device** — pas immédiatement au `DEVICE_ANNCE` (le device n'est pas forcément prêt à recevoir une commande à cet instant, et un device déjà appairé qui redémarre simplement ne renvoie pas toujours ce signal), et une seule fois par device (pas de boucle périodique, contrairement au hack retiré d'`old/`). Valeur de démo : `DEMO_HEATING_SETPOINT_DEG` (14°C)
+  - ⚠️ Historique : c'était initialement un flag global unique (`g_demo_setpoint_sent`) plutôt que par device — avec le vrai KETOTEK et le simulateur `/thermostat` appairés simultanément, le premier des deux à rapporter après un boot de la gateway "gagnait" la consigne de démo et l'autre ne la recevait jamais (le simulateur, avec son rythme fixe 30s, battait systématiquement le vrai device). Corrigé en trackant l'envoi par `short_addr`.
   - Réception côté thermostat : `handle_tuya_set_data()` (thermostat) — met à jour `g_occupied_heating_setpoint`
   - ✅ Validé sur les 2 cartes physiques
 
@@ -99,12 +100,29 @@ Le round-trip DP103 est resté silencieux (aucune erreur, mais rien reçu) penda
 | `0x00` | `TUYA_CMD_SET_DATA` | gateway → device | Écrire un DP (ex: consigne DP103) |
 | `0x01` | `TUYA_CMD_REPORT_1` | device → gateway | Rapport spontané (utilisé par le simulateur `/thermostat`) |
 | `0x02` | `TUYA_CMD_REPORT_2` | device → gateway | Rapport spontané observé sur le vrai KTF0177 |
-| `0x11` | `TUYA_CMD_QUERY` | gateway → device | Requête "tous les DP" (implémentée côté envoi, jamais testée) |
+| `0x11` | `TUYA_CMD_QUERY` | gateway → device | Requête "tous les DP" — **testée sur le réel, acceptée mais sans effet** (voir "Data Query" ci-dessous) |
 | `0x24` | `TUYA_CMD_TIME_SYNC` | device → gateway | Requête de synchro horaire — reçue mais non traitée (TODO) |
 
 ### Types de données (`DP_TYPE`)
 
 `0x01` Bool (1 byte) · `0x02` Value (int32 big-endian, 4 bytes) · `0x03` String · `0x04` Enum (1 byte) · `0x05` Bitmap.
+
+### Data Query (`0x11`) — testée sur le réel, n'apporte pas de dump complet
+
+`old/TUYA_ZIGBEE_PROTOCOL.md` prédit qu'une requête `0x11` fait répondre le device avec tous ses DP (commande `0x01` ou `0x02`). Testé sur le KTF0177 réel (`gateway/main/esp_zigbee_gateway.c`, probe de debug déclenchée à chaque rapport DP5 — voir `tuya_send_data_query()`) :
+
+* La tête répond par une **ZCL Default Response** standard (`ESP_ZB_CORE_CMD_DEFAULT_RESP_CB_ID = 0x1005`, décodée dans `zb_action_handler()`), avec `resp_to_cmd=0x11 status=0x00 (SUCCESS)` — la commande est donc **comprise et acceptée**, pas rejetée comme "cluster non supporté".
+* Même comportement observé pour `TUYA_CMD_SET_DATA (0x00)` : `resp_to_cmd=0x00 status=0x00 (SUCCESS)` — c'est la tête qui accuse simplement réception au niveau ZCL (`disableDefaultResponse` non positionné côté gateway), indépendamment du contenu Tuya de la commande.
+* **Mais aucune rafale de DP ne suit** cet accusé de réception. La tête continue son cycle de rapports spontanés habituel (un DP à la fois, à son propre rythme). Conclusion actuelle : sur ce device/firmware, `0x11` est un no-op fonctionnel côté Tuya malgré l'ack ZCL positif — pas de moyen connu de forcer un dump d'état complet à la demande, seulement d'attendre les rapports spontanés DP par DP.
+* Probe de test laissée active dans le code (déclenchée sur DP5) au cas où ce comportement varierait (reboot de la tête, mise à jour firmware, etc.).
+
+### ZCL Read Attributes (cluster `0x0201`) — testé sur le réel, échec (silence)
+
+Alternative tentée au Data Query Tuya : lecture standard ZCL `Read Attributes` sur le cluster Thermostat `0x0201` (`local_temperature`, `occupied_heating_setpoint`, `system_mode`), déclenchée en parallèle du Data Query à chaque rapport DP5 (`zcl_send_read_thermostat_attrs()`, `gateway/main/esp_zigbee_gateway.c`).
+
+* **Aucune réponse** de la tête — ni `ZCL Read Attr Response` (`ESP_ZB_CORE_CMD_READ_ATTR_RESP_CB_ID`), ni même un `Default Response` d'erreur (confirmé en ajoutant le cluster au log du Default Response : seuls `0xef00`/`0x00` et `0xef00`/`0x11` reviennent, jamais `0x0201`).
+* Conclusion : le cluster `0x0201` est probablement déclaré par la tête uniquement pour la compatibilité profil HA, sans être réellement câblé sur des données vivantes — le firmware Tuya ne répond que sur son cluster propriétaire `0xEF00`.
+* **Pas de piste de lecture "pull" fonctionnelle identifiée à ce jour** (ni `0x11` sur `0xEF00`, ni ZCL standard sur `0x0201`) — la seule source d'information fiable reste les rapports spontanés DP par DP.
 
 ## DataPoints confirmés (table Saswell/KETOTEK)
 
@@ -119,7 +137,7 @@ Repris du converter Saswell de `zigbee-herdsman-converters` (voir `old/ZIGBEE2MQ
 | 40 | `KETOTEK_DP_CHILD_LOCK` | Bool | Verrouillage enfant | Décodé (log), non observé sur le réel |
 | 101 | `KETOTEK_DP_SYSTEM_STATE` | Bool | Marche/arrêt | ✅ Envoyé par le simulateur, à confirmer sur le réel |
 | 102 | `KETOTEK_DP_LOCAL_TEMP` | Value ×10°C | Température mesurée | ✅ Envoyé par le simulateur, à confirmer sur le réel |
-| 103 | `KETOTEK_DP_HEATING_SETPOINT` | Value ×10°C | Consigne de chauffe | ✅ Round-trip gateway↔device validé (simulateur **et** réel, voir "Cas reel") |
+| 103 | `KETOTEK_DP_HEATING_SETPOINT` | Value ×10°C | Consigne de chauffe | ✅ Round-trip validé sur le **simulateur** uniquement. ⚠️ Sur le **vrai** KTF0177 : la commande est acceptée (`ZCL Default Response status=SUCCESS`) mais **n'a aucun effet réel** — l'écran de la tête ne change pas. Voir DP4 ci-dessous, le vrai DP d'écriture sur le réel. |
 | 104 | `KETOTEK_DP_VALVE_POSITION` | Value, 0-100% | Position de vanne | Décodé (log), non observé sur le réel |
 | 105 | `KETOTEK_DP_BATTERY_LOW` | Bool | Pile faible | Décodé (log), non observé sur le réel |
 | 106 | `KETOTEK_DP_AWAY_MODE` | Bool | Mode absence | Décodé (log), non observé sur le réel |
@@ -131,7 +149,10 @@ Repris du converter Saswell de `zigbee-herdsman-converters` (voir `old/ZIGBEE2MQ
 
 Observés en conditions réelles avec le KTF0177 physique (short addr `0x3d6e`, 2026-08-09), non documentés dans le converter Saswell :
 
-* **DP4 — `KETOTEK_DP_HEATING_SETPOINT_ECHO`** (Value ×10°C) : **confirmé**. Envoie la consigne actuellement appliquée sur la tête. Validé en deux temps : (1) après un envoi gateway→device de 14°C (DP103), la valeur de DP4 a convergé progressivement vers `140` (14.0°C) sur plusieurs rapports successifs ; (2) confirmé de façon décisive en changeant la consigne **manuellement sur la tête elle-même** — DP4 a suivi ce changement, prouvant qu'il s'agit bien d'un miroir de la consigne appliquée (et non d'une mesure de température ambiante ou d'une position de vanne). Décodé dans `tuya_log_dp()`.
+* **DP4 — `KETOTEK_DP_HEATING_SETPOINT_ECHO`** (Value ×10°C) : **confirmé, lecture ET écriture**. C'est le DP fonctionnel de la consigne de chauffe sur le vrai KTF0177 — DP103 (table Saswell) est accepté mais ignoré (voir ci-dessus).
+  - **Lecture** (device → gateway) : reflète la consigne actuellement appliquée sur la tête. Validé en deux temps : (1) après un envoi gateway→device de 14°C sur DP103, la valeur de DP4 a convergé progressivement vers `140` (14.0°C) sur plusieurs rapports successifs ; (2) confirmé en changeant la consigne **manuellement sur la tête elle-même** — DP4 a suivi ce changement.
+  - **Écriture** (gateway → device) : **confirmé** en envoyant directement `SET_DATA` sur DP4 (`tuya_send_set_temperature()`, `gateway/main/esp_zigbee_gateway.c`) — **la consigne affichée sur l'écran de la tête a changé**, contrairement à un envoi sur DP103 seul qui reste sans effet malgré l'accusé ZCL SUCCESS.
+  - Décodé dans `tuya_log_dp()`, écrit dans `tuya_send_set_temperature()` (en plus de DP103, conservé pour le round-trip avec le simulateur).
 * **DP2 — `KETOTEK_DP_CONTROL_MODE`** (Enum, 1 byte) : **confirmé**. Mode Manuel/Automatique de la tête, basculé par le bouton central — doc constructeur : *"Temperature Control Mode: Switch between manual and automatic modes by pressing the middle button."* Sens des valeurs confirmé par observation directe de l'écran de la tête : **`0` = Automatique**, **`1` = Manuel**. Décodé dans `tuya_log_dp()`.
 * **DP7 — `KETOTEK_DP_CHILD_LOCK_REAL`** (Bool, 1 byte) : **confirmé**. Verrouillage enfant — confirmé en activant puis désactivant le verrouillage sur la tête et en observant DP7 passer `1`(ON) → `0`(OFF) en conséquence. La table Saswell/KETOTEK documente le child lock sur **DP40** (`KETOTEK_DP_CHILD_LOCK`), jamais observé sur ce device réel ; c'est en fait **DP7** qui est utilisé, comme le devinait (correctement, cette fois) `old/TUYA_ZIGBEE_PROTOCOL.md`. Décodé dans `tuya_log_dp()`.
 * **DP5 — `KETOTEK_DP_LOCAL_TEMP_REAL`** (Value ×10°C) : **confirmé**. Température locale mesurée — deux relevés successifs (23.0°C puis 24.0°C, montée progressive cohérente avec une mesure réelle) confirmés identiques à la valeur affichée sur l'écran de la tête. La table Saswell/KETOTEK documente la température locale sur **DP102** (`KETOTEK_DP_LOCAL_TEMP`), jamais observé sur ce device réel ; c'est en fait **DP5** qui est utilisé, comme le devinait `old/TUYA_ZIGBEE_PROTOCOL.md`. Décodé dans `tuya_log_dp()`.
