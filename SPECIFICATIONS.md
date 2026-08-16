@@ -68,4 +68,4 @@ Chaque commande envoyée par la RPI porte un `command_id` (identifiant unique g�
 
 ## ESP32-C6-ZERO
 
-L'ESP32 s'occupe de gérer la communication avec les têtes et la RPI. Elle implemente l'appairage d'un device et la gestion des différents DP en lecture et écriture via l'exposition du protocole UART
+L'ESP32 s'occupe de gérer la communication avec les têtes et la RPI. Elle implemente l'appairage d'un device et la gestion des différents DP en lecture et écriture via l'exposition du protocole UART.
