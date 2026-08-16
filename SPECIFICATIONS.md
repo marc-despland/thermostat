@@ -69,3 +69,31 @@ Chaque commande envoyée par la RPI porte un `command_id` (identifiant unique g�
 ## ESP32-C6-ZERO
 
 L'ESP32 s'occupe de gérer la communication avec les têtes et la RPI. Elle implemente l'appairage d'un device et la gestion des différents DP en lecture et écriture via l'exposition du protocole UART.
+
+Le rôle Zigbee et le décodage Tuya décrits ci-dessous reprennent tels quels ce qui a été validé sur matériel réel dans le prototype (`/prototype/gateway`, voir `prototype/SPECIFICATIONS.md`) ; seules l'exposition UART et quelques fonctions de gestion restent à écrire.
+
+### Rôle Zigbee
+* Coordinateur (`ESP_ZB_DEVICE_TYPE_COORDINATOR`, macro `ESP_ZB_ZC_CONFIG()`) — c'est l'ESP32 qui forme le réseau, les têtes s'y joignent en tant qu'End Device
+* Radio native 802.15.4 de l'ESP32-C6 (`ZB_RADIO_MODE_NATIVE`), pas de co-processeur radio externe
+* Canal fixé par compilation (25 par défaut) — pas de changement de canal à chaud sans reflash pour l'instant
+* Endpoint 1, profil HA (`ESP_ZB_AF_HA_PROFILE_ID`), device ID thermostat (`ESP_ZB_HA_THERMOSTAT_DEVICE_ID`)
+* Clusters exposés : Basic (`0x0000`), Identify, Power Config, Thermostat (`0x0201` — présent pour la conformité au profil HA mais non réellement câblé côté firmware Tuya des têtes, aucune donnée ne transite dessus), et le cluster propriétaire Tuya `0xEF00` en double rôle CLIENT+SERVER
+
+### Appairage
+* Au démarrage (factory-new ou simple reboot), le réseau est réouvert automatiquement pendant 180s (`esp_zb_bdb_open_network(180)`) — pas besoin de commande manuelle pour qu'une tête déjà en mode pairing puisse rejoindre
+* Un nouveau device est détecté via le signal `ESP_ZB_ZDO_SIGNAL_DEVICE_ANNCE`, puis identifié par lecture ZCL standard du cluster Basic (« magic packet » : `manufacturerName`, `modelIdentifier`, `zclVersion`, `powerSource`...) — seule méthode d'identification fiable observée, le cluster Thermostat ne répondant pas
+* Le device est ajouté à la table des devices appairés, et un message UART `pairing_request` est émis vers la RPI (adresse courte, adresse IEEE, fabricant, modèle)
+
+### Lecture des données (DP)
+* Réception des rapports Tuya spontanés du cluster `0xEF00` (commandes `TY_DATA_RESPONE` `0x01` et `TY_DATA_REPORT` `0x02`), décodage des DataPoints confirmés (DP2 mode, DP3 état de chauffe, DP4 consigne, DP5 température mesurée, DP7 verrouillage enfant) et traduction en message UART `status_report` vers la RPI
+* Pas de mécanisme de lecture « à la demande » fiable : la commande Tuya `TY_DATA_QUERY` (`0x03`) reste sans réponse sur le matériel réel testé, et le cluster ZCL standard `0x0201` ne répond pas non plus — l'ESP32 se contente donc de relayer les rapports spontanés des têtes vers la RPI, il ne fait pas de polling actif vers elles
+
+### Écriture des données (DP)
+* Écriture confirmée fonctionnelle sur le matériel réel pour DP4 (consigne), via commande Tuya `TY_DATA_REQUEST` (`0x00`), type `VALUE`, valeur encodée ×10 en big-endian ; le même mécanisme est réutilisable pour DP2 (mode) et DP7 (verrouillage enfant)
+* À la réception d'un message UART `set_heating_setpoint`/`set_system_mode`/`set_child_lock`, l'ESP32 construit la trame Tuya correspondante et l'envoie à la tête identifiée par son `short_addr`, puis renvoie un `command_ack` (succès, ou échec — ex. device inconnu ou injoignable)
+* Type ZCL impérativement `ESP_ZB_ZCL_ATTR_TYPE_SET` (jamais `ARRAY`, qui réinterprète les 2 premiers octets comme un préfixe de taille et fait rejeter silencieusement la trame par la couche réseau — bug rencontré et corrigé dans le prototype)
+
+### Fonctions restant à développer (au-delà de ce que valide le prototype)
+* Exposition effective du protocole UART décrit ci-dessus (JSON + `sign`) : le prototype se contente de logguer les échanges Zigbee, il n'y a pas encore de liaison série vers une RPI
+* Commandes `list_devices` / `remove_device` / `permit_join` pilotables depuis la RPI (dans le prototype, seule l'ouverture réseau au boot existe, pas de CLI)
+* Persistance NVS de la table des devices appairés (en RAM dans le prototype, perdue à chaque reboot de l'ESP32)
