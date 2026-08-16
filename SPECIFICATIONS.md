@@ -42,8 +42,9 @@ Les messages seront structurés en json avec un format :
 | `pairing_request` | Signal Zigbee `ESP_ZB_ZDO_SIGNAL_DEVICE_ANNCE` (un device rejoint le réseau) | `short_addr`, `ieee_addr` (MAC), `manufacturer` (ex. `_TZE200_p3dbf6qs`), `model` (ex. `TS0601`) — lus via la lecture ZCL du cluster Basic (« magic packet », validée sur le KTF0177 réel) |
 | `status_report` | Réception d'un rapport Tuya décodé (DataPoints) | `short_addr` et, selon les DP effectivement reçus dans la trame : `system_mode` (`auto`/`heat`/`off`, DP2), `running_state` (`heat`/`idle`, DP3), `heating_setpoint` (°C, DP4), `local_temp` (°C, DP5), `child_lock` (bool, DP7). Un rapport peut ne contenir qu'un sous-ensemble de ces champs. |
 | `command_ack` | Accusé de réception d'une commande envoyée par la RPI | `command_id` (repris de la commande d'origine), `status` (`ok`/`error`), `error` (message, si `status = error`) |
-| `device_left` | Départ/suppression d'un device du réseau Zigbee | `short_addr` |
-| `devices_list` | Réponse à la commande `list_devices` | `devices` : tableau de `{ short_addr, ieee_addr, manufacturer, model }` |
+| `device_left` | Départ spontané d'un device du réseau Zigbee (hors révocation demandée par la RPI, ex. reset usine du device) | `short_addr` |
+| `devices_list` | Réponse à la commande `list_devices` : état courant tel que vu par l'ESP32 (peut différer de la liste connue de la RPI si des devices ont rejoint/quitté depuis) | `devices` : tableau de `{ short_addr, ieee_addr, manufacturer, model }` |
+| `known_devices_request` | Émis une fois au démarrage de l'ESP32, avant toute ouverture du réseau Zigbee | *(vide)* |
 
 ### Sens RPI vers ESP32
 
@@ -52,15 +53,18 @@ Les messages seront structurés en json avec un format :
 | `set_heating_setpoint` | Écrit la consigne de chauffe (DP4) sur la tête | `short_addr`, `value` (°C, ex. `21.0`) |
 | `set_system_mode` | Écrit le mode (DP2) sur la tête | `short_addr`, `value` (`auto`/`heat`/`off`) |
 | `set_child_lock` | Écrit le verrouillage enfant (DP7) sur la tête | `short_addr`, `value` (bool) |
-| `permit_join` | Ouvre la fenêtre d'appairage Zigbee | `duration_sec` (ex. `180`) |
-| `list_devices` | Retourne la liste des devices appairés | *(vide)* |
-| `remove_device` | Retire un device du réseau Zigbee | `short_addr` |
+| `permit_join` | Ouvre la fenêtre d'appairage Zigbee (le réseau est **fermé par défaut**, y compris au démarrage — voir « Appairage » ci-dessous) | `duration_sec` (ex. `180`) |
+| `list_devices` | Retourne l'état courant des devices appairés côté ESP32 | *(vide)* |
+| `remove_device` | Révoque l'appairage d'un device : quitte le réseau Zigbee (ZDO Leave) et le retire de la table en mémoire | `short_addr` |
+| `known_devices_list` | Réponse à `known_devices_request` : liste des devices déjà connus, source de vérité côté RPI | `devices` : tableau de `{ short_addr, ieee_addr, manufacturer, model }` |
 
 Chaque commande envoyée par la RPI porte un `command_id` (identifiant unique généré côté RPI, ex. compteur ou UUID court) afin de pouvoir corréler la `command_ack` correspondante.
 
 ### Notes d'implémentation
 * Les champs de `status_report`/`set_*` reprennent uniquement les DataPoints **confirmés** sur le vrai KETOTEK KTF0177 dans le prototype (DP2/DP4/DP5/DP7 — voir `prototype/SPECIFICATIONS.md` § « DataPoints confirmés »). Les autres DP déjà décodés en lecture seule côté gateway (planning hebdomadaire DP28-34, protection hors-gel DP36, anti-entartrage DP39, calibration DP47, etc.) ne sont pas encore exposés dans ce protocole UART ; extension possible une fois un besoin identifié côté RPI/UI.
-* `list_devices`, `remove_device` et `permit_join` correspondent aux commandes CLI encore non implémentées côté gateway dans le prototype (`TODO(THERMOSTAT_ENABLE_CLI)`) — il faudra les développer sur l'ESP32 avant de pouvoir les piloter depuis la RPI. `permit_join` peut s'appuyer directement sur `esp_zb_bdb_open_network()`, déjà utilisé au démarrage de la gateway.
+* Le réseau Zigbee est **fermé par défaut**, y compris au démarrage de l'ESP32 : aucun nouveau device ne peut rejoindre tant que la RPI n'a pas envoyé `permit_join`. C'est un changement volontaire par rapport au prototype, où `esp_zb_bdb_open_network(180)` était appelé automatiquement à chaque boot.
+* `list_devices`, `remove_device` et `permit_join` correspondent aux commandes CLI encore non implémentées côté gateway dans le prototype (`TODO(THERMOSTAT_ENABLE_CLI)`) — il faudra les développer sur l'ESP32 avant de pouvoir les piloter depuis la RPI. `permit_join` peut s'appuyer directement sur `esp_zb_bdb_open_network()`, déjà utilisé au démarrage de la gateway dans le prototype.
+* La RPI est la source de vérité de la liste des devices connus (persistée côté RPI, pas sur l'ESP32). Au démarrage, l'ESP32 envoie `known_devices_request` et attend la réponse `known_devices_list` de la RPI pour reconstruire sa table en mémoire avant d'interagir avec le réseau Zigbee — ceci remplace le besoin de persistance NVS locale des devices appairés côté ESP32.
 * Pas de polling périodique prévu depuis la RPI pour lire l'état des têtes : comme observé sur le vrai KTF0177, les rapports Tuya sont spontanés, à la discrétion du firmware de la tête (pas de cadence fixe garantie, contrairement au simulateur du prototype qui rapporte toutes les 30s). La RPI doit donc consommer les `status_report` au fil de l'eau plutôt qu'attendre une réponse synchrone à une requête de lecture.
 * Pas de commande Tuya « data query » fiable côté device réel (voir `prototype/SPECIFICATIONS.md` § « Erreur historique sur `0x11` ») : impossible de forcer une tête à renvoyer son état à la demande, y compris via ce protocole UART — seuls les rapports spontanés font foi.
 
@@ -80,9 +84,11 @@ Le rôle Zigbee et le décodage Tuya décrits ci-dessous reprennent tels quels c
 * Clusters exposés : Basic (`0x0000`), Identify, Power Config, Thermostat (`0x0201` — présent pour la conformité au profil HA mais non réellement câblé côté firmware Tuya des têtes, aucune donnée ne transite dessus), et le cluster propriétaire Tuya `0xEF00` en double rôle CLIENT+SERVER
 
 ### Appairage
-* Au démarrage (factory-new ou simple reboot), le réseau est réouvert automatiquement pendant 180s (`esp_zb_bdb_open_network(180)`) — pas besoin de commande manuelle pour qu'une tête déjà en mode pairing puisse rejoindre
-* Un nouveau device est détecté via le signal `ESP_ZB_ZDO_SIGNAL_DEVICE_ANNCE`, puis identifié par lecture ZCL standard du cluster Basic (« magic packet » : `manufacturerName`, `modelIdentifier`, `zclVersion`, `powerSource`...) — seule méthode d'identification fiable observée, le cluster Thermostat ne répondant pas
-* Le device est ajouté à la table des devices appairés, et un message UART `pairing_request` est émis vers la RPI (adresse courte, adresse IEEE, fabricant, modèle)
+* Le réseau Zigbee est **fermé par défaut**, y compris au démarrage de l'ESP32 — contrairement au prototype, qui rouvrait automatiquement le réseau 180s à chaque boot (`esp_zb_bdb_open_network(180)` appelé systématiquement dans `esp_zb_app_signal_handler()`). Ici, l'ouverture n'a lieu que sur réception explicite d'une commande UART `permit_join` envoyée par la RPI (durée paramétrable, ex. 180s)
+* Avant même de traiter le réseau Zigbee, l'ESP32 démarre par une phase de synchronisation avec la RPI : il envoie `known_devices_request` et attend la réponse `known_devices_list` pour reconstruire en mémoire sa table des devices déjà connus (adresse courte, adresse IEEE, fabricant, modèle) — la RPI est la source de vérité persistée, l'ESP32 ne conserve rien en flash de son côté
+* Un nouveau device est détecté via le signal `ESP_ZB_ZDO_SIGNAL_DEVICE_ANNCE` (uniquement possible pendant une fenêtre `permit_join` ouverte), puis identifié par lecture ZCL standard du cluster Basic (« magic packet » : `manufacturerName`, `modelIdentifier`, `zclVersion`, `powerSource`...) — seule méthode d'identification fiable observée, le cluster Thermostat ne répondant pas
+* Le device est ajouté à la table en mémoire, et un message UART `pairing_request` est émis vers la RPI (adresse courte, adresse IEEE, fabricant, modèle) ; c'est à la RPI de le persister dans sa propre liste de devices connus
+* La RPI peut à tout moment révoquer l'appairage d'un device via `remove_device` (`short_addr`) : l'ESP32 le fait quitter le réseau Zigbee (ZDO Leave) et le retire de sa table en mémoire, puis répond par un `command_ack`
 
 ### Lecture des données (DP)
 * Réception des rapports Tuya spontanés du cluster `0xEF00` (commandes `TY_DATA_RESPONE` `0x01` et `TY_DATA_REPORT` `0x02`), décodage des DataPoints confirmés (DP2 mode, DP3 état de chauffe, DP4 consigne, DP5 température mesurée, DP7 verrouillage enfant) et traduction en message UART `status_report` vers la RPI
@@ -96,4 +102,5 @@ Le rôle Zigbee et le décodage Tuya décrits ci-dessous reprennent tels quels c
 ### Fonctions restant à développer (au-delà de ce que valide le prototype)
 * Exposition effective du protocole UART décrit ci-dessus (JSON + `sign`) : le prototype se contente de logguer les échanges Zigbee, il n'y a pas encore de liaison série vers une RPI
 * Commandes `list_devices` / `remove_device` / `permit_join` pilotables depuis la RPI (dans le prototype, seule l'ouverture réseau au boot existe, pas de CLI)
-* Persistance NVS de la table des devices appairés (en RAM dans le prototype, perdue à chaque reboot de l'ESP32)
+* Réseau fermé par défaut au démarrage (le prototype ouvre systématiquement le réseau 180s à chaque boot — comportement à retirer au profit d'une ouverture uniquement sur `permit_join`)
+* Échange `known_devices_request`/`known_devices_list` au démarrage, pour reconstruire la table en mémoire depuis la RPI (le prototype n'a pas ce mécanisme — sa table `g_paired_devices[]` est en RAM et repart vide à chaque reboot, sans aucune synchronisation)
