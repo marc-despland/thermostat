@@ -8,6 +8,9 @@ Le projet consiste à réaliser un thermostat connecté permettant de piloter un
  * Ecran tactile Waveshare 3,5"
  * Tête thermostatique : KETOTEK KTF0177
  * Communication RPI <-> ESP32 : UART
+ * Capteur de temperature GY-BME280-3.3
+ * Relais de pilotage de la chaudière : Panasonic AQY212GH
+ * Chaudière Gaz ELM Leblanc — Chaudière gaz bas NOx murale ACLEIS BAS NOX NGLM 24-7XN, mixte 24kW, 11L/min
 
 
 # Spécifications logiciel
@@ -15,6 +18,8 @@ Le projet consiste à réaliser un thermostat connecté permettant de piloter un
 * [Specifications protocol UART](SPECIFICATIONS-UART.md)
 * [Specification ESP32-C6-UART](SPECIFICATIONS-ESP32-C6-ZERO.md)
 * [Specification Raspberry PI Zero](SPECIFICATIONS-PIZERO.md)
+* [Specification Programmation du chauffage](SPECIFICATIONS-PROGRAM.md)
+* [Plan de câblage](SPECIFICATIONS-CABLAGE.md)
 
 
 
