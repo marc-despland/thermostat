@@ -2,7 +2,7 @@
 
 L'ESP32 s'occupe de gérer la communication avec les têtes et la RPI. Elle implemente l'appairage d'un device et la gestion des différents DP en lecture et écriture via l'exposition du protocole UART.
 
-Le rôle Zigbee et le décodage Tuya décrits ci-dessous reprennent tels quels ce qui a été validé sur matériel réel dans le prototype (`/prototype/gateway`, voir `prototype/SPECIFICATIONS.md`) ; seules l'exposition UART et quelques fonctions de gestion restent à écrire.
+Le rôle Zigbee et le décodage Tuya décrits ci-dessous reprennent tels quels ce qui a été validé sur matériel réel dans l'ancien prototype (`/prototype/gateway`, voir `prototype/SPECIFICATIONS.md` — gardé comme référence, code non actif) ; l'implémentation cible vit dans `/controller-zigbee` (voir l'arborescence du code dans [SPECIFICATIONS.md](SPECIFICATIONS.md)), où seules l'exposition UART et quelques fonctions de gestion restent à écrire.
 
 ### Rôle Zigbee
 * Coordinateur (`ESP_ZB_DEVICE_TYPE_COORDINATOR`, macro `ESP_ZB_ZC_CONFIG()`) — c'est l'ESP32 qui forme le réseau, les têtes s'y joignent en tant qu'End Device

@@ -1,5 +1,5 @@
-## Protocol UART
-Le protocol UART va permettre une communication bidirectionnelle entre la RPI et l'ESP32 pour piloter et remonter l'information des têtes thermostatiques. Le protocole applicatif (JSON + signature) et les types de messages ci-dessous s'appuient sur ce que le prototype (`/prototype`, voir `prototype/SPECIFICATIONS.md`) a validé côté radio Zigbee/Tuya avec une vraie tête KETOTEK KTF0177 : identification du device, DataPoints confirmés (mode, consigne, température mesurée, verrouillage enfant) et commandes gateway existantes ou restant à implémenter.
+zigbee## Protocol UART
+Le protocol UART va permettre une communication bidirectionnelle entre la RPI et l'ESP32 pour piloter et remonter l'information des têtes thermostatiques. Le protocole applicatif (JSON + signature) et les types de messages ci-dessous s'appuient sur ce que l'ancien prototype (`/prototype`, voir `prototype/SPECIFICATIONS.md` — gardé comme référence, code non actif) a validé côté radio Zigbee/Tuya avec une vraie tête KETOTEK KTF0177 : identification du device, DataPoints confirmés (mode, consigne, température mesurée, verrouillage enfant) et commandes gateway existantes ou restant à implémenter. L'implémentation cible de ce protocole vit dans `/controller-zigbee` (ESP32) et `/thermostat` (RPI) — voir l'arborescence du code dans [SPECIFICATIONS.md](SPECIFICATIONS.md).
 
 ### Transport
 * Liaison série 115200 bauds, 8N1, sans contrôle de flux matériel (à revoir si la distance/le câblage l'imposent)

@@ -37,11 +37,11 @@ Ensuite `ssh pizero` suffit pour se connecter — c'est cet alias qui est utilis
 
 ## 4. Organisation du code applicatif dans le repo
 
-Le code de l'application Pi Zero vit dans ce repo, à côté de `prototype/` (ESP32), par exemple dans un dossier `pizero-app/`. Rien ne change dans le flux de travail habituel : édition avec VSCode/Claude Code sur le Mac, commits git normaux.
+Le code de l'application Pi Zero vit dans ce repo, dans le dossier `/thermostat` (voir l'arborescence du code dans [SPECIFICATIONS.md](SPECIFICATIONS.md)), à côté de `/controller-zigbee` (ESP32) ; `/prototype` est l'ancien code de validation matérielle, gardé comme référence, non actif. Rien ne change dans le flux de travail habituel : édition avec VSCode/Claude Code sur le Mac, commits git normaux.
 
 ## 5. Script de déploiement
 
-`pizero-app/deploy.sh` — synchronise le code vers le Pi et redémarre le service applicatif :
+`thermostat/deploy.sh` — synchronise le code vers le Pi et redémarre le service applicatif :
 
 ```bash
 #!/usr/bin/env bash
@@ -49,18 +49,18 @@ set -euo pipefail
 
 rsync -avz --delete \
   --exclude '.venv' --exclude '__pycache__' --exclude '*.pyc' \
-  ./pizero-app/ pizero:/home/pi/thermostat-app/
+  ./thermostat/ pizero:/home/pi/thermostat/
 
-ssh pizero 'sudo systemctl restart thermostat-app'
+ssh pizero 'sudo systemctl restart thermostat'
 ```
 
 ```bash
-chmod +x pizero-app/deploy.sh
+chmod +x thermostat/deploy.sh
 ```
 
 ## 6. Service systemd
 
-Pour que l'application démarre au boot du Pi et puisse être redémarrée simplement après chaque déploiement, créer sur le Pi `/etc/systemd/system/thermostat-app.service` :
+Pour que l'application démarre au boot du Pi et puisse être redémarrée simplement après chaque déploiement, créer sur le Pi `/etc/systemd/system/thermostat.service` :
 
 ```ini
 [Unit]
@@ -68,8 +68,8 @@ Description=Thermostat - application écran tactile
 After=network.target
 
 [Service]
-WorkingDirectory=/home/pi/thermostat-app
-ExecStart=/usr/bin/python3 /home/pi/thermostat-app/main.py
+WorkingDirectory=/home/pi/thermostat
+ExecStart=/usr/bin/python3 /home/pi/thermostat/main.py
 Restart=on-failure
 User=pi
 
@@ -80,7 +80,7 @@ WantedBy=multi-user.target
 Puis :
 
 ```bash
-ssh pizero 'sudo systemctl daemon-reload && sudo systemctl enable --now thermostat-app'
+ssh pizero 'sudo systemctl daemon-reload && sudo systemctl enable --now thermostat'
 ```
 
 (Adapter `ExecStart` selon le langage/runtime réellement choisi pour l'application.)
@@ -88,8 +88,8 @@ ssh pizero 'sudo systemctl daemon-reload && sudo systemctl enable --now thermost
 ## 7. Consultation des logs à distance
 
 ```bash
-ssh pizero 'journalctl -u thermostat-app -n 100 --no-pager'
-ssh pizero 'journalctl -u thermostat-app -f'   # suivi en direct
+ssh pizero 'journalctl -u thermostat -n 100 --no-pager'
+ssh pizero 'journalctl -u thermostat -f'   # suivi en direct
 ```
 
 ## 8. Vérification visuelle de l'écran tactile
@@ -109,8 +109,8 @@ Les commandes `ssh`/`rsync`/`scp` déclenchent une confirmation de permission la
 
 ## Résumé du cycle de développement
 
-1. Éditer le code dans `pizero-app/` sur le Mac (VSCode / Claude Code).
-2. `./pizero-app/deploy.sh` — synchronise et redémarre le service sur le Pi.
-3. `ssh pizero 'journalctl -u thermostat-app -f'` — vérifier qu'il démarre sans erreur.
+1. Éditer le code dans `/thermostat` sur le Mac (VSCode / Claude Code).
+2. `./thermostat/deploy.sh` — synchronise et redémarre le service sur le Pi.
+3. `ssh pizero 'journalctl -u thermostat -f'` — vérifier qu'il démarre sans erreur.
 4. Capture d'écran (§8) si le changement touche l'IHM.
 5. Commit git une fois validé.

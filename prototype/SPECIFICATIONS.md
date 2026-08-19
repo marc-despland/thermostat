@@ -1,3 +1,5 @@
+> **Note** : ce dossier `/prototype` contient l'ancien code de validation matérielle, conservé comme référence/exemple — ce n'est plus le code actif du projet. Le code actif vit dans `/controller-zigbee` (gateway ESP32-C6) et `/thermostat` (application Raspberry Pi), voir l'arborescence dans [../SPECIFICATIONS.md](../SPECIFICATIONS.md). Les chemins `/gateway` et `/thermostat` ci-dessous sont relatifs à ce dossier (donc `prototype/gateway` et `prototype/thermostat`) — ne pas confondre ce dernier avec le nouveau `/thermostat` à la racine du repo, qui désigne l'application Raspberry Pi.
+
 La cible du projet est de créer une gateway ZigBee sur une ESP32-C6-ZERO qui sera capable d'interagir avec une tête thermostatique programable KETOTEK KTF0177
 
 * le répertoire /gateway contient le projet ESP-IDF de la gateway

@@ -23,3 +23,10 @@ Le projet consiste à réaliser un thermostat connecté permettant de piloter un
 * [Specification de l'API REST](SPECIFICATION-API.md)
 * [Plan de câblage](SPECIFICATIONS-CABLAGE.md)
 * [Installation et déploiement sur la Raspberry Pi Zero](INSTALLATION-PIZERO.md)
+
+# Arborescence du code
+
+/controller-zigbee : le code de L'ESP32-C6-ZERO
+/thermostat : le code de la raspberry pi
+
+Le répertoire `/prototype` contient l'ancien code de validation matérielle (gateway ESP32 + simulateur de tête, voir [prototype/SPECIFICATIONS.md](prototype/SPECIFICATIONS.md)) — gardé comme référence/exemple, ce n'est plus le code actif du projet.
