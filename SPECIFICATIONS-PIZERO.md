@@ -1,5 +1,24 @@
 ## Rasberry PI Zero
 * persistence des données : SQLite avec le mode WAL activé
+* modèle cible : Pi Zero / Zero W (premier gen, mono-cœur ARM11 1 GHz, 512 Mo RAM) — contrainte forte pour les choix de stack ci-dessous
+
+## Stack applicative
+
+Le matériel visé (mono-cœur, RAM limitée) écarte d'office les stacks UI lourdes (moteur OpenGL, navigateur) ; les choix ci-dessous privilégient le rendu direct et un runtime interprété léger, suffisant vu que l'appli est très majoritairement I/O-bound (UART, SQLite, tick périodique) plutôt que CPU-bound.
+
+| Couche | Choix | Raison |
+|---|---|---|
+| Langage | Python 3 | Écosystème adapté à tous les besoins de l'appli (UART, JSON, SQLite), itération rapide, cohérent avec les structures déjà spécifiées (tables SQL, JSON de programmation) |
+| OS | Raspberry Pi OS Lite, sans environnement de bureau | Libère toute la RAM/CPU disponibles pour l'appli plutôt que pour X11/un compositeur |
+| UI tactile | [LVGL](https://lvgl.io/) (bindings Python), rendu direct sur le framebuffer Linux (`/dev/fb0`), entrée tactile via `evdev` | Pas de serveur X ni de rendu OpenGL ES à charge du GPU ; bibliothèque conçue à l'origine pour du matériel bien plus contraint qu'un Pi Zero (microcontrôleurs), donc large marge sur ce SoC ; widgets prêts à l'emploi (boutons, listes, sliders, clavier virtuel) correspondant aux écrans de [SPECIFICATION-PIZERO-SCREEN.md](SPECIFICATION-PIZERO-SCREEN.md) |
+| Communication UART | `pyserial` | Implémentation standard du protocole décrit dans [SPECIFICATIONS-UART.md](SPECIFICATIONS-UART.md) |
+| Persistance | `sqlite3` (module standard) | Cf. ligne ci-dessus (WAL) |
+| Lancement | Service systemd | Démarrage automatique au boot, redémarrage après déploiement — voir [INSTALLATION-PIZERO.md](INSTALLATION-PIZERO.md) |
+
+Alternatives écartées pour l'IHM, du fait du matériel visé :
+* **Kivy / PyQt / PySide** — moteurs de rendu (OpenGL ES pour Kivy, Qt complet pour PyQt/PySide) trop gourmands pour un mono-cœur 512 Mo en parallèle du backend SQLite/UART ; latence perceptible rapportée sur Pi Zero premier gen dans des projets similaires.
+* **UI web (ex. Flask + Chromium en mode kiosque)** — Chromium hors de portée en RAM/CPU sur ce modèle.
+* **Tkinter** — modèle de widgets peu adapté au tactile, performances médiocres même sans X11 complet.
 
 ### Dialogue avec l'ESP32-C6-ZERO
 

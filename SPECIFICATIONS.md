@@ -20,4 +20,6 @@ Le projet consiste à réaliser un thermostat connecté permettant de piloter un
 * [Specification Raspberry PI Zero](SPECIFICATIONS-PIZERO.md)
 * [Specification Programmation du chauffage](SPECIFICATIONS-PROGRAM.md)
 * [Specification des écrans et de la navigation](SPECIFICATION-PIZERO-SCREEN.md)
+* [Specification de l'API REST](SPECIFICATION-API.md)
 * [Plan de câblage](SPECIFICATIONS-CABLAGE.md)
+* [Installation et déploiement sur la Raspberry Pi Zero](INSTALLATION-PIZERO.md)
