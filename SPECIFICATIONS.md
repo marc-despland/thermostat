@@ -19,23 +19,5 @@ Le projet consiste à réaliser un thermostat connecté permettant de piloter un
 * [Specification ESP32-C6-UART](SPECIFICATIONS-ESP32-C6-ZERO.md)
 * [Specification Raspberry PI Zero](SPECIFICATIONS-PIZERO.md)
 * [Specification Programmation du chauffage](SPECIFICATIONS-PROGRAM.md)
+* [Specification des écrans et de la navigation](SPECIFICATION-PIZERO-SCREEN.md)
 * [Plan de câblage](SPECIFICATIONS-CABLAGE.md)
-
-
-
-
-
-
-### Les écrans
-
-Descriptions des fonctions de l'application
-* Administration
-    * ouverture du reseau pour 180s
-        * detection d'un nouveau device 
-            * Accepter
-            * refuser
-    * liste des devices connus
-        * affichage d'un device
-            * Renomer 
-            * Supprimer
-    * Forcer la chaudière en mode chauffage ON/OFF
