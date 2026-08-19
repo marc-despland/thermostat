@@ -13,12 +13,24 @@ Le matériel visé (mono-cœur, RAM limitée) écarte d'office les stacks UI lou
 | UI tactile | [LVGL](https://lvgl.io/) (bindings Python), rendu direct sur le framebuffer Linux (`/dev/fb0`), entrée tactile via `evdev` | Pas de serveur X ni de rendu OpenGL ES à charge du GPU ; bibliothèque conçue à l'origine pour du matériel bien plus contraint qu'un Pi Zero (microcontrôleurs), donc large marge sur ce SoC ; widgets prêts à l'emploi (boutons, listes, sliders, clavier virtuel) correspondant aux écrans de [SPECIFICATION-PIZERO-SCREEN.md](SPECIFICATION-PIZERO-SCREEN.md) |
 | Communication UART | `pyserial` | Implémentation standard du protocole décrit dans [SPECIFICATIONS-UART.md](SPECIFICATIONS-UART.md) |
 | Persistance | `sqlite3` (module standard) | Cf. ligne ci-dessus (WAL) |
+| API REST | **FastAPI** + **Uvicorn** (sans l'extra `[standard]`, un seul worker) | Génère automatiquement le schéma OpenAPI et sert Swagger UI (`/docs`) / ReDoc (`/redoc`) sans configuration manuelle, à partir des modèles Pydantic des ressources de [SPECIFICATION-API.md](SPECIFICATION-API.md) (Device, Program, Event, Preset, Override...) — pratique pour tester l'API manuellement en SSH ([INSTALLATION-PIZERO.md](INSTALLATION-PIZERO.md)) |
 | Lancement | Service systemd | Démarrage automatique au boot, redémarrage après déploiement — voir [INSTALLATION-PIZERO.md](INSTALLATION-PIZERO.md) |
 
 Alternatives écartées pour l'IHM, du fait du matériel visé :
 * **Kivy / PyQt / PySide** — moteurs de rendu (OpenGL ES pour Kivy, Qt complet pour PyQt/PySide) trop gourmands pour un mono-cœur 512 Mo en parallèle du backend SQLite/UART ; latence perceptible rapportée sur Pi Zero premier gen dans des projets similaires.
 * **UI web (ex. Flask + Chromium en mode kiosque)** — Chromium hors de portée en RAM/CPU sur ce modèle.
 * **Tkinter** — modèle de widgets peu adapté au tactile, performances médiocres même sans X11 complet.
+
+### Point de vigilance FastAPI sur Pi Zero W (armv6l)
+
+FastAPI s'appuie sur Pydantic v2, dont le cœur (`pydantic-core`) est écrit en Rust — sur une architecture aussi ancienne que l'armv6l du Pi Zero/Zero W premier gen, ça fait craindre une compilation Rust sur la carte elle-même (irréaliste sur un mono-cœur 512 Mo). En pratique :
+
+* PyPI seul ne publie pas de wheel `manylinux` pour armv6l (seulement armv7l et plus) — `pip` en configuration générique tenterait donc de compiler depuis les sources.
+* **[piwheels](https://www.piwheels.org/project/pydantic-core/)** — l'index de wheels précompilées pour Raspberry Pi, utilisé par défaut par `pip` sur Raspberry Pi OS (`/etc/pip.conf` le pointe déjà) — publie bien des wheels **armv6l précompilées** pour `pydantic-core`, y compris sur les versions récentes (Python 3.11/3.13, alignées avec Raspberry Pi OS Bullseye/Bookworm/Trixie).
+
+⚠️ Ne pas modifier/désactiver la configuration pip par défaut de Raspberry Pi OS (qui pointe vers piwheels), sous peine de retomber sur une compilation Rust sur la carte. Filet de sécurité si un wheel venait un jour à manquer : Flask + `flask-smorest` (100 % Python, basé sur `marshmallow`, aucune dépendance Rust).
+
+Pour rester léger sur ce matériel : installer `uvicorn` sans l'extra `[standard]` (évite `uvloop`/`httptools`/`watchfiles`, inutiles pour un seul client local à faible cadence de requêtes), un seul worker, et servir les assets Swagger UI en local plutôt que depuis un CDN (le thermostat n'a pas d'accès Internet garanti en continu).
 
 ### Dialogue avec l'ESP32-C6-ZERO
 
